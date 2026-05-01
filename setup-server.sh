@@ -41,7 +41,13 @@ conda activate "$ENV_NAME"
 echo
 echo "=== [2/4] PyTorch $TORCH_VER + CUDA $CUDA_TAG (from pytorch.org wheels) ==="
 pip install --upgrade pip
-pip install "torch==$TORCH_VER" --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+# Install torch + torchvision together so they share an ABI. timm pulls
+# torchvision in transitively; if pip later resolves a non-matching
+# torchvision wheel, you get `RuntimeError: operator torchvision::nms
+# does not exist` at import time.
+TORCHVISION_VER=0.20.1   # matches torch 2.5.1
+pip install "torch==$TORCH_VER" "torchvision==$TORCHVISION_VER" \
+    --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
 
 echo
 echo "=== [3/4] PT-V3 CUDA-bound deps (spconv + torch-scatter) ==="
