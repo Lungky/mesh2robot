@@ -184,6 +184,7 @@ def main() -> None:
     log_keys: list[str] | None = None
     log_rows: list[dict] = []
 
+    t_run_start = time.time()
     global_step = 0
     for epoch in range(1, args.epochs + 1):
         # --- train ---
@@ -250,7 +251,11 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(log_rows)
 
-    print(f"\nDone. Logs at {log_path}")
+    total_s = time.time() - t_run_start
+    print(f"\nDone. Total training time: {total_s:.1f}s "
+          f"({total_s/60:.1f} min, {total_s/3600:.2f} hr) "
+          f"over {args.epochs} epochs.")
+    print(f"Logs at {log_path}")
 
 
 if __name__ == "__main__":
