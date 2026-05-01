@@ -62,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mesh2robot.core.joint_extraction import JointEstimate
 from mesh2robot.core.physics import compute_link_inertials
-from mesh2robot.core.template_match import match as match_template
+from mesh2robot.core.physics_defaults import make_default_template
 from mesh2robot.core.urdf_assembly import AssemblyInput, assemble
 from mesh2robot.data_gen.urdf_loader import INT_TO_JOINT_TYPE
 from mesh2robot.model.model import Mesh2RobotModel
@@ -506,7 +506,7 @@ def build_urdf_from_predictions(
     per_link_collisions_by_body = dict(per_link_meshes_by_body)
 
     dof = len(je_list)
-    tpl = match_template(dof, [j.type for j in je_list])
+    tpl = make_default_template(dof)
     inertials = compute_link_inertials(per_link_meshes_by_body, density=tpl.density)
 
     n_bodies = len(link_ids_in_order)

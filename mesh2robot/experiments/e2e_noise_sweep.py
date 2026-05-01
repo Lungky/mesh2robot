@@ -22,7 +22,7 @@ from mesh2robot.core.motion_segmentation import (
     segment_multi_pose,
 )
 from mesh2robot.core.physics import compute_link_inertials, split_mesh_by_labels
-from mesh2robot.core.template_match import match as match_template
+from mesh2robot.core.physics_defaults import make_default_template
 from mesh2robot.core.urdf_assembly import AssemblyInput, assemble
 from mesh2robot.experiments.feasibility_xarm6 import (
     axis_angle_error,
@@ -58,7 +58,7 @@ def _run_once(sigma_mm: float, seed: int, faces: np.ndarray,
 
     # Phase 4
     query_dof = sum(1 for j in joints if j.type == "revolute")
-    tpl = match_template(query_dof, [j.type for j in joints])
+    tpl = make_default_template(query_dof)
     per_link_meshes = split_mesh_by_labels(pose_pts[0], faces, seg.labels)
     inertials = compute_link_inertials(per_link_meshes, density=tpl.density)
 

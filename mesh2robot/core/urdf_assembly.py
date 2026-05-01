@@ -27,7 +27,7 @@ from jinja2 import Template as JinjaTemplate
 
 from mesh2robot.core.joint_extraction import JointEstimate
 from mesh2robot.core.physics import LinkInertial
-from mesh2robot.core.template_match import Template
+from mesh2robot.core.physics_defaults import Template
 
 
 URDF_TEMPLATE = JinjaTemplate(

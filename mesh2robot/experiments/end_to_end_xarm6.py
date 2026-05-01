@@ -29,7 +29,7 @@ from mesh2robot.core.motion_segmentation import (
     segment_multi_pose,
 )
 from mesh2robot.core.physics import compute_link_inertials, split_mesh_by_labels
-from mesh2robot.core.template_match import match as match_template
+from mesh2robot.core.physics_defaults import make_default_template
 from mesh2robot.core.urdf_assembly import AssemblyInput, assemble
 from mesh2robot.experiments.feasibility_xarm6 import (
     evaluate_segmentation,
@@ -89,10 +89,10 @@ def main():
     print(f"  joints={len(joints)}  ({sum(1 for j in joints if j.type=='revolute')} revolute)")
 
     # --- Phase 4: template match + per-link physics ---
-    print("\nPhase 4: template match + inertials ...")
+    print("\nPhase 4: physics defaults + inertials ...")
     query_dof = sum(1 for j in joints if j.type == "revolute")
-    tpl = match_template(query_dof, [j.type for j in joints])
-    print(f"  template={tpl.name}  density={tpl.density:.0f} kg/m^3")
+    tpl = make_default_template(query_dof)
+    print(f"  density={tpl.density:.0f} kg/m^3 (fixed)")
 
     per_link_meshes = split_mesh_by_labels(pose_pts[0], faces, seg.labels)
 

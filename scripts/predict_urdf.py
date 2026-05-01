@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mesh2robot.core.joint_extraction import JointEstimate
 from mesh2robot.core.physics import compute_link_inertials
-from mesh2robot.core.template_match import match as match_template
+from mesh2robot.core.physics_defaults import make_default_template
 from mesh2robot.core.urdf_assembly import AssemblyInput, assemble
 from mesh2robot.data_gen.urdf_loader import INT_TO_JOINT_TYPE
 from mesh2robot.model.dataset import K_LINKS_MAX
@@ -270,12 +270,11 @@ def main() -> None:
     per_link_collisions_by_body = dict(per_link_meshes_by_body)
 
     # --- 6. Inertials ---
-    # Need a density estimate before computing inertials. Use template later
-    # for the final assembly density; for now match_template first.
+    # Physics defaults (density / friction / damping / effort / velocity)
+    # are fixed conservative values; nothing here is a DB lookup.
     dof = len(je_list)
-    jtypes_seq = [j.type for j in je_list]
-    tpl = match_template(dof, jtypes_seq)
-    print(f"\nTemplate match: {tpl.name}  density={tpl.density:.0f} kg/m^3")
+    tpl = make_default_template(dof)
+    print(f"\nPhysics defaults: density={tpl.density:.0f} kg/m^3 (fixed)")
     inertials = compute_link_inertials(per_link_meshes_by_body, density=tpl.density)
     for body_id, ine in sorted(inertials.items()):
         print(f"  body {body_id} mass={ine.mass:.3f} kg")
