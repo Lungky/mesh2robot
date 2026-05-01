@@ -1,0 +1,69 @@
+# mesh2robot — conda environment spec.
+#
+# One command on either machine:
+#   conda env create -f environment.yml
+#   conda activate mesh2robot
+#
+# Then to update after pulling new deps:
+#   conda env update -f environment.yml --prune
+#
+# CUDA notes:
+#   `pytorch-cuda=12.4` is what the runtime uses; the host's nvcc/driver
+#   only needs to be ≥ 12.4. The local dev box (Win11 + 3090) is on
+#   driver-side CUDA 12.4. The H200 server runs nvcc 12.8 — that's
+#   forward-compatible with 12.4 bundled binaries, so the SAME env file
+#   works on both. Bump to `pytorch-cuda=12.6` or `=12.8` here once
+#   spconv-cu126 / spconv-cu128 wheels are stable on PyPI.
+
+name: mesh2robot
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.13
+
+  # Core scientific
+  - numpy>=2.0
+  - scipy>=1.13
+
+  # Robot / mesh I/O (conda-forge builds avoid VTK / mujoco wheel pain)
+  - trimesh>=4.10
+  - mujoco>=3.5
+  - imageio>=2.35
+
+  # 3D viewer (conda VTK is the reliable one — pip VTK breaks headless)
+  - pyvista>=0.47
+  - vtk>=9.6
+
+  # Image processing — conda's opencv has ArUco built in (4.7+ moved it to main)
+  - opencv>=4.10
+
+  # Physics (Tier-3 collision sweep)
+  - pybullet>=3.2
+
+  # Templating / utilities
+  - jinja2>=3.1
+  - tqdm>=4.65
+  - matplotlib>=3.8
+
+  # PT-V3 backbone non-CUDA deps
+  - timm>=1.0
+  - addict>=2.4
+
+  # ─── PyTorch + CUDA toolkit (bundled, doesn't need host nvcc match) ─────
+  - pytorch::pytorch>=2.5
+  - pytorch::pytorch-cuda=12.4
+
+  # ─── pip-only additions ───────────────────────────────────────────────
+  - pip
+  - pip:
+    # Read pip-only packages from requirements.txt (yourdfpy, robot_descriptions, xacrodoc)
+    - -r requirements.txt
+    # CUDA-bound — must match `pytorch-cuda` above. spconv-cu124 + torch-scatter
+    # for torch-2.X+cu124. Bump the cu### suffix here together with pytorch-cuda above.
+    - spconv-cu124>=2.3
+    - --find-links https://data.pyg.org/whl/torch-2.6.0+cu124.html
+    - torch-scatter>=2.1

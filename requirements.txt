@@ -1,6 +1,12 @@
-numpy>=2.0
-scipy>=1.13
-trimesh>=4.0
-yourdfpy>=0.0.50
+# mesh2robot — pip-only dependencies (referenced from environment.yml).
+# Everything that has a working conda-forge / pytorch-channel build lives
+# in environment.yml; this file is just for the few pip-only packages.
+
+# URDF parsing — pip-only (not on conda-forge as of 2026-05).
+yourdfpy>=0.0.55
+
+# Robot description URLs / catalog — pip-only.
 robot_descriptions>=1.20
+
+# xacro expansion (a few upstream URDFs need it) — pip-only.
 xacrodoc>=0.1
