@@ -50,6 +50,33 @@ class PointNetEncoder(nn.Module):
         return x, g
 
 
+# Named PT-V3 configs. Use `--encoder-size <name>` at training time;
+# the chosen name gets saved in checkpoint["args"] so predict scripts
+# can reconstruct the same architecture before load_state_dict.
+PTV3_CONFIGS: dict[str, dict] = {
+    # Small (~30M params) — fits a 24 GB 3090 at batch 16-32 × 16k pts.
+    # This is the historical default and matches model_v2_ptv3_25ep.
+    "small": dict(
+        enc_depths=(2, 2, 2, 4, 2),
+        enc_channels=(32, 64, 128, 256, 384),
+        enc_num_head=(2, 4, 8, 16, 24),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+    ),
+    # Base (~120M params) — wider channels + deeper stage-3/4. Targets
+    # H200-class GPUs (143 GB VRAM); batch 64-96 × 16k pts typical.
+    "base": dict(
+        enc_depths=(2, 2, 4, 6, 2),
+        enc_channels=(64, 128, 256, 384, 512),
+        enc_num_head=(4, 8, 16, 24, 32),
+        dec_depths=(2, 2, 4, 4),
+        dec_channels=(128, 128, 256, 384),
+        dec_num_head=(8, 8, 16, 24),
+    ),
+}
+
+
 class PointTransformerV3Encoder(nn.Module):
     """Wraps Pointcept's PointTransformerV3 to produce per-point and global
     features for an entire (B, N, 3) batch, identical interface to PointNet.
@@ -61,8 +88,9 @@ class PointTransformerV3Encoder(nn.Module):
       4. Reshape back to (B, N, F).
       5. Max-pool per-batch for the global feat.
 
-    Default config is "medium" (~30M params) which fits comfortably in
-    24 GB VRAM at batch 16-32 × 8k pts.
+    `size` ∈ PTV3_CONFIGS picks the architecture (default "small"). Any
+    of the per-stage args below override the named config — useful for
+    one-off experiments without adding a new config name.
     """
 
     def __init__(
@@ -70,14 +98,25 @@ class PointTransformerV3Encoder(nn.Module):
         feat_dim: int = 64,
         grid_size: float = 0.02,    # in normalized-mesh units (~unit ball)
         enable_flash: bool = False,
-        # Override these to scale the model up/down:
-        enc_depths: tuple[int, ...] = (2, 2, 2, 4, 2),
-        enc_channels: tuple[int, ...] = (32, 64, 128, 256, 384),
-        enc_num_head: tuple[int, ...] = (2, 4, 8, 16, 24),
-        dec_depths: tuple[int, ...] = (2, 2, 2, 2),
-        dec_channels: tuple[int, ...] = (64, 64, 128, 256),
-        dec_num_head: tuple[int, ...] = (4, 4, 8, 16),
+        size: str = "small",
+        # Per-stage overrides (None → take from PTV3_CONFIGS[size]):
+        enc_depths: tuple[int, ...] | None = None,
+        enc_channels: tuple[int, ...] | None = None,
+        enc_num_head: tuple[int, ...] | None = None,
+        dec_depths: tuple[int, ...] | None = None,
+        dec_channels: tuple[int, ...] | None = None,
+        dec_num_head: tuple[int, ...] | None = None,
     ) -> None:
+        if size not in PTV3_CONFIGS:
+            raise ValueError(f"Unknown PT-V3 size {size!r}; "
+                             f"choose from {list(PTV3_CONFIGS)}")
+        cfg = PTV3_CONFIGS[size]
+        enc_depths = enc_depths if enc_depths is not None else cfg["enc_depths"]
+        enc_channels = enc_channels if enc_channels is not None else cfg["enc_channels"]
+        enc_num_head = enc_num_head if enc_num_head is not None else cfg["enc_num_head"]
+        dec_depths = dec_depths if dec_depths is not None else cfg["dec_depths"]
+        dec_channels = dec_channels if dec_channels is not None else cfg["dec_channels"]
+        dec_num_head = dec_num_head if dec_num_head is not None else cfg["dec_num_head"]
         super().__init__()
         self.grid_size = grid_size
         self.feat_dim = dec_channels[0]   # PT-V3 output dim per point

@@ -75,7 +75,12 @@ def main() -> None:
     parser.add_argument("--encoder", choices=["pointnet", "ptv3"],
                         default="pointnet",
                         help="Backbone encoder. 'pointnet' is the 0.5M baseline; "
-                             "'ptv3' is the Point Transformer V3 upgrade (~30M).")
+                             "'ptv3' is the Point Transformer V3 upgrade.")
+    parser.add_argument("--encoder-size", choices=["small", "base"],
+                        default="small",
+                        help="PT-V3 size: 'small' (~30M, fits 24 GB GPUs) or "
+                             "'base' (~120M, designed for H200-class 80+ GB GPUs). "
+                             "Saved in checkpoint args; predict scripts read it back.")
     parser.add_argument("--in-memory", action="store_true",
                         help="Preload all shards into RAM at startup (5 GB). "
                              "Eliminates per-batch disk I/O — significant speedup "
@@ -159,9 +164,14 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = Mesh2RobotModel(feat_dim=256, encoder=args.encoder).to(device)
+    model = Mesh2RobotModel(
+        feat_dim=256,
+        encoder=args.encoder,
+        encoder_size=args.encoder_size,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {n_params/1e6:.1f}M")
+    print(f"Model params: {n_params/1e6:.1f}M  (encoder={args.encoder}, "
+          f"size={args.encoder_size})")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr,
                               weight_decay=args.weight_decay)

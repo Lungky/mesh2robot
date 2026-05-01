@@ -153,15 +153,17 @@ class Mesh2RobotModel(nn.Module):
         self,
         feat_dim: int = 256,
         encoder: str = "pointnet",
+        encoder_size: str = "small",
     ) -> None:
         super().__init__()
         self.encoder_kind = encoder
+        self.encoder_size = encoder_size
         if encoder == "pointnet":
             self.encoder = _PointNetEncoder(in_dim=3, feat_dim=feat_dim)
             seg_in_dim = 2 * feat_dim         # concat(per_point, global)
             global_dim = feat_dim
         elif encoder == "ptv3":
-            self.encoder = PointTransformerV3Encoder()
+            self.encoder = PointTransformerV3Encoder(size=encoder_size)
             seg_in_dim = self.encoder.feat_dim + self.encoder.global_feat_dim
             global_dim = self.encoder.global_feat_dim
         else:

@@ -162,7 +162,13 @@ def main() -> None:
 
     # --- 3. Inference ---
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = Mesh2RobotModel(feat_dim=256, encoder=args.encoder).to(device)
+    ckpt_peek = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    encoder_size = ckpt_peek.get("args", {}).get("encoder_size", "small")
+    print(f"  Encoder size from checkpoint: {encoder_size}")
+    del ckpt_peek
+    model = Mesh2RobotModel(
+        feat_dim=256, encoder=args.encoder, encoder_size=encoder_size,
+    ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     load_info = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if load_info.missing_keys:

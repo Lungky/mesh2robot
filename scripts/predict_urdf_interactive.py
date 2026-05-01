@@ -1588,7 +1588,15 @@ def main() -> None:
 
     # --- ML runs ONCE here ---
     print(f"\nLoading checkpoint: {args.checkpoint}")
-    model = Mesh2RobotModel(feat_dim=256, encoder=args.encoder).to(device)
+    # Peek at checkpoint to recover the encoder_size used at training; fall
+    # back to "small" for older checkpoints that didn't save it.
+    ckpt_peek = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    encoder_size = ckpt_peek.get("args", {}).get("encoder_size", "small")
+    print(f"  Encoder size from checkpoint: {encoder_size}")
+    del ckpt_peek
+    model = Mesh2RobotModel(
+        feat_dim=256, encoder=args.encoder, encoder_size=encoder_size,
+    ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     # strict=False so checkpoints predating the LimitsHead still load. Any
     # missing-key warnings are surfaced once at the bottom.
