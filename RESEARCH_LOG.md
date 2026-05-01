@@ -27,7 +27,7 @@ Project goal: real-to-sim articulated robot asset generation from MILO-reconstru
 | **D.3** | **Motion-image refinement** | **Wired (2026-05-01)** | Stage 3 opt-in via `--motion-dir`; Path-B legacy code reused; bottlenecked on test_2 calibration quality |
 | **D.4** | **Geometric joint extraction** | **In progress (2026-05-01)** | 3D-circle fit on inter-link boundary loops; universal fallback when retrieval similarity is low |
 | **D.5** | **Retrieve-or-extract dispatch** | Pending | Wire D.2 + D.4 into the interactive script as primary + fallback |
-| **D.6** | **Joint limits as model output + collision sweep** | **In progress (2026-05-01)** | LimitsHead added to model + losses; v3 shards regenerating; PyBullet sweep refines model limits at inference; legacy `urdf_db.json` deprecated |
+| **D.6** | **Joint limits as model output + collision sweep** | **Training (2026-05-02)** | PT-V3 base (106.5M) + LimitsHead training on H200 (batch=24, lr=5e-4, 50 ep); v3 shards 889/28,400 examples; ep1 step230 limits_mae 0.92; legacy `urdf_db.json` deprecated; PyBullet sweep wired |
 | **E** | VLM refinement layer | Optional / deferred | Render mesh + ask VLM to verify/correct uncertain joints |
 | **F** | Evaluation benchmark | Pending | Real-scan validation set + ablations vs heuristic + Articulate-Anything baseline |
 
@@ -92,12 +92,50 @@ Sanity check on per-joint limits across spot-checked shards:
 
 Distributions match the URDF/MJCF source values (no clamping artifacts beyond the documented PRISM_CAP at 2 m). Ready for training.
 
-### Pending (committed; user approved)
+### H200 deployment + training launched (2026-05-02)
 
-- Retrain PT-V3 25 epochs on `data/training_shards_v3 + data/training_shards_v3_mjcf` with the new `LimitsHead`. **User asked to switch to H200 before launching this.**
-- Once trained, end-to-end test on `test_2`: model-predicted limits → sweep refinement → final URDF.
+Project moved to a remote NVIDIA H200 (143 GB VRAM, CUDA 12.8 driver) over SSH for the v3 training run; local Win11 + 3090 stays as the inference / annotation box. Three notable infra resolutions worth recording so future repeat-deployments don't re-discover them:
 
-### Files touched / added / removed
+1. **Conda env spec is unsolvable on miniconda 26 + libmamba** — pytorch + nvidia + conda-forge channel mix explodes on libabseil/protobuf/numpy + Python 3.13. Ditched the YAML; replaced with `setup-server.sh` (committed): tiny conda env with just `python=3.12 pip`, then everything via pip. PyTorch's official wheel index is the reliable CUDA path.
+2. **torch + torchvision + torch-scatter ABI must align** — `data.pyg.org` torch-scatter wheels for `torch-2.6.0+cu124` had a `_ZN5torch3jit17parseSchemaOrName` ABI mismatch. Rolled back to `torch==2.5.1+cu124 + torchvision==0.20.1 + torch-scatter==2.1.2+pt25cu124`, which is the stable wheel anchor as of 2026-05.
+3. **Container `/dev/shm` is 64 MB and unprivileged remount is denied** — `DataLoader(num_workers>0)` died with bus errors trying to share batches via shm. Workaround: `--num-workers 0` + `--in-memory` (5 GB shards fit in container RAM trivially, no disk I/O to parallelize anyway).
+
+Added `--encoder-size {small,base}` flag to `train_model.py` to expose PT-V3's per-stage channels/depths. `base` is **106.5M params** (3.3× the 31.8M `small`); the H200's VRAM headroom finally makes it tractable.
+
+**Training run config (live):**
+```
+encoder           : ptv3-base   (106.5M params)
+shards            : v3 URDF + v3 MJCF (889 shards / 28,400 examples / 572 robots)
+split             : stratified by-robot, canonical_train_set filter
+batch_size        : 24
+lr                : 5e-4 (cosine to 0 over 50 epochs)
+n_points          : 16384
+in_memory         : True
+num_workers       : 0
+epochs            : 50
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+VRAM utilization at ep1 step 60: **122 / 143 GB ≈ 85 %**. Sweet spot — comfortable headroom, model is well-fed.
+
+**Health check at ep1 step 230:**
+| Signal | Value | Interpretation |
+|---|---:|---|
+| `loss/limits` | 1.07 | Active — `LimitsHead` gradient flowing, not stuck near zero |
+| `metric/limits_mae` | 0.92 | Cold-start; mixed-units (radians/metres) baseline |
+| `loss/seg` | 2.45 | Normal CE for K=64 classes early in training |
+| `metric/seg_acc` | 28.4 % | Same trajectory as v2 (49.5 % final) |
+| `metric/axis_deg` | 54.6° | Same starting region as v2 (~60° early) |
+| `metric/valid_acc` | 88.8 % | Already converging; easiest task |
+
+End-to-end pipeline confirmed live: v3 shards' `joint_limits` field → dataset loader → `JointHead.limits_head` → smooth-L1 loss against masked targets → backprop. Output checkpoint will be `data/checkpoints/model_v3_ptv3_base_50ep/`.
+
+### Pending
+
+- Wait for 50-epoch training to complete (estimate 4–8 hours on H200 at batch 24 + base model).
+- rsync trained checkpoint local → run end-to-end test on `test_2`: model-predicted limits → `--collision-sweep` refinement → final URDF.
+
+### Files touched / added / removed (cumulative for D.6)
 
 ```
 + mesh2robot/core/collision_sweep.py     PyBullet self-collision sweep (Tier-3)
@@ -105,15 +143,22 @@ Distributions match the URDF/MJCF source values (no clamping artifacts beyond th
 ~ mesh2robot/data_gen/urdf_loader.py     articulate_and_label now returns joint_limits (J, 2)
 ~ mesh2robot/data_gen/mjcf_loader.py     articulate_and_label_mjcf same
 ~ mesh2robot/model/dataset.py            loads joint_limits + has_limits flag
-~ mesh2robot/model/model.py              JointHead.limits_head Linear(256, 2)
+~ mesh2robot/model/model.py              JointHead.limits_head Linear(256, 2); encoder_size param
+~ mesh2robot/model/encoders.py           PTV3_CONFIGS dict; size= constructor arg ('small' | 'base')
 ~ mesh2robot/model/losses.py             smooth-L1 limits term + masked MAE metric
 ~ scripts/generate_training_data.py      packs joint_limits into shards
-~ scripts/predict_urdf_interactive.py    pred_limits + --collision-sweep flag
-~ scripts/predict_urdf.py                strict=False checkpoint loader
+~ scripts/train_model.py                 --encoder-size flag plumbed through
+~ scripts/predict_urdf_interactive.py    pred_limits + --collision-sweep flag; reads encoder_size from ckpt
+~ scripts/predict_urdf.py                strict=False checkpoint loader; reads encoder_size from ckpt
 ~ scripts/smoke_test_data_gen.py         updated 7-tuple unpack
 - data/urdf_db.json                      renamed to .deprecated
-+ data/training_shards_v3_mjcf/          343 shards / 10,950 examples / 219 robots
-+ data/training_shards_v3/               URDF regen in progress
++ data/training_shards_v3/               546 shards / 17,450 examples / 353 robots / 3.1 GB
++ data/training_shards_v3_mjcf/          343 shards / 10,950 examples / 219 robots / 1.9 GB
++ environment.yml                        local-with-GUI conda spec (python 3.12 + vtk + pyvista)
++ environment-server.yml                 server-only conda spec (no vtk/pyvista; later superseded by setup-server.sh)
++ setup-server.sh                        pip-based bootstrap; sidesteps conda channel solver
++ requirements.txt                       slimmed to pip-only stragglers (yourdfpy, robot_descriptions, xacrodoc)
++ requirements-cuda-local.txt            (deleted; rolled into setup-server.sh)
 ```
 
 ---
