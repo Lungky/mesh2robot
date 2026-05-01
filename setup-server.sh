@@ -20,7 +20,9 @@ set -euo pipefail
 
 ENV_NAME=mesh2robot
 PY_VER=3.12
-TORCH_VER=2.6.0
+# torch 2.5.1+cu124 — pyg-team's stable wheel anchor (2.6.0 wheels at
+# data.pyg.org had ABI mismatches per H200 install on 2026-05-02).
+TORCH_VER=2.5.1
 CUDA_TAG=cu124        # bundled toolkit version; runs fine on host nvcc 12.8
 
 echo "=== [1/4] Creating minimal conda env: $ENV_NAME (python=$PY_VER) ==="
