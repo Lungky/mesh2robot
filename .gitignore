@@ -1,0 +1,92 @@
+# ─── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# ─── Virtual environments ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+.python-version
+
+# ─── Editor / OS ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Claude Code / agent state (session-local; never commit) ────────────────
+.claude/
+
+# ─── Heavy generated data: training shards (multi-GB each) ──────────────────
+# Regenerate with `scripts/generate_training_data.py` from
+# data/raw_robots + the manifest.
+data/training_shards*/
+
+# ─── Heavy generated data: model checkpoints (~11 GB) ───────────────────────
+# Reproduce by retraining; the canonical-robot manifest + shards is the
+# upstream-sufficient input.
+data/checkpoints/
+
+# ─── Heavy source data: raw URDFs/MJCFs from upstream repos (~6.6 GB) ───────
+# Re-fetch with the build scripts in scripts/build_robot_manifest.py
+# (or re-clone the upstream sources listed in ROADMAP §8).
+data/raw_robots/
+
+# ─── Generated synthetic outputs / smoke-test artefacts ─────────────────────
+data/synthetic/
+data/synthetic_train_smoke/
+data/generated/
+data/visualizations/
+data/results/
+data/raw/
+
+# ─── Per-shard log files (re-emitted on regen) ──────────────────────────────
+data/*.log
+data/training_shards*.log
+
+# ─── Deprecated / archived data files ───────────────────────────────────────
+*.deprecated
+
+# ─── Reconstruction outputs (per-test, large, regenerable) ──────────────────
+output/
+
+# ─── Test scan input data (per-test, ~250 MB; user-specific MILO captures) ──
+# Each test_N/ contains a MILO scan + photos + calibration. Keep locally,
+# don't push to remote. Document the capture protocol in ROADMAP §1, not
+# here, so a fresh clone can rebuild scans following the protocol.
+input/
+
+# ─── Stray / leftover ───────────────────────────────────────────────────────
+New folder/
+
+# ─── Lockfiles ──────────────────────────────────────────────────────────────
+*.lock
+.git/index.lock
+
+# ─── Common large binary artefacts (caught at any path) ─────────────────────
+# These should always be regeneratable; don't allow stray ones into git.
+*.glb
+*.usd
+*.usda
+*.usdc
+*.ply
+*.npz
+*.pt
+*.ckpt
+*.safetensors
+*.tfrecord
+
+# ─── EXPLICIT KEEPS (override the wildcard ignores above) ───────────────────
+# The manifest JSONs are small-but-load-bearing; checked in for reproducibility.
+# (data/*.json is implicitly tracked; no rule above ignores them.)
+# Explicit keeps for files inside otherwise-ignored dirs go below as
+# `!data/path/...` if needed.
