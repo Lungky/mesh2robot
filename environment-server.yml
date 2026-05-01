@@ -1,0 +1,60 @@
+# mesh2robot — server-only conda env (TRAINING ONLY, no GUI deps).
+#
+# Use this on remote training boxes (H200, etc.) where the interactive
+# annotation GUI never runs. Drops vtk + pyvista (which trip on
+# ffmpeg/qt resolver paths) and pins Python to 3.12 (PyTorch's conda
+# channel doesn't ship 3.13 builds yet as of 2026-05).
+#
+# Setup:
+#   conda env create -f environment-server.yml
+#   conda activate mesh2robot
+#   python -c "import torch; print(torch.cuda.get_device_name(0))"
+#
+# For local interactive work (with the PyVista annotation GUI), use
+# `environment.yml` instead.
+
+name: mesh2robot
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12       # pytorch conda channel: 3.10/3.11/3.12 only
+
+  # Core scientific
+  - numpy>=2.0
+  - scipy>=1.13
+
+  # Robot / mesh I/O
+  - trimesh>=4.10
+  - mujoco>=3.5
+  - imageio>=2.35
+
+  # Image processing (motion-image refinement, ArUco)
+  - opencv>=4.10
+
+  # Physics (Tier-3 collision sweep)
+  - pybullet>=3.2
+
+  # Templating / utilities
+  - jinja2>=3.1
+  - tqdm>=4.65
+  - matplotlib>=3.8
+
+  # PT-V3 backbone non-CUDA deps
+  - timm>=1.0
+  - addict>=2.4
+
+  # PyTorch + bundled CUDA toolkit (forward-compat with H200 nvcc 12.8)
+  - pytorch::pytorch>=2.5
+  - pytorch::pytorch-cuda=12.4
+
+  # pip-only additions
+  - pip
+  - pip:
+    - -r requirements.txt
+    - spconv-cu124>=2.3
+    - --find-links https://data.pyg.org/whl/torch-2.6.0+cu124.html
+    - torch-scatter>=2.1

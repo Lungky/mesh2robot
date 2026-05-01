@@ -23,7 +23,8 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.13
+  - python=3.12       # pytorch conda channel ships up to 3.12 as of 2026-05;
+                      # bump when PyTorch publishes 3.13 builds
 
   # Core scientific
   - numpy>=2.0
