@@ -44,7 +44,15 @@ pip install "torch==$TORCH_VER" --index-url "https://download.pytorch.org/whl/$C
 echo
 echo "=== [3/4] PT-V3 CUDA-bound deps (spconv + torch-scatter) ==="
 pip install "spconv-$CUDA_TAG"
-pip install torch-scatter -f "https://data.pyg.org/whl/torch-$TORCH_VER+$CUDA_TAG.html"
+# IMPORTANT: pin version + force wheel-only. With just `-f <url>`, pip
+# adds the pyg index but may still grab the latest torch-scatter from
+# PyPI (source dist) and silently build against a wrong torch ABI,
+# producing `undefined symbol _ZN5torch3jit17parseSchemaOrNameERKSsb`
+# at import time. `--only-binary=:all:` forces wheels; `==2.1.2` is
+# the version with prebuilt wheels for torch-2.6.0+cu124 + py3.12.
+pip install --no-cache-dir "torch-scatter==2.1.2" \
+    --only-binary=:all: \
+    -f "https://data.pyg.org/whl/torch-$TORCH_VER+$CUDA_TAG.html"
 
 echo
 echo "=== [4/4] Remaining deps ==="
