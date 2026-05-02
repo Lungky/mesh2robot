@@ -4,7 +4,7 @@ Real-to-sim robot asset generation pipeline. Takes a 3D scan (or multi-view phot
 
 **As of 2026-04-25 the project pivoted from a heuristic single-plane-cut pipeline to a learned 3D foundation model trained on a multi-source URDF dataset (371 canonical robots after dedup, from 572 trainable / 2020 raw entries).** See [RESEARCH_LOG.md](RESEARCH_LOG.md) for the full timeline. The earlier heuristic phases below are retained for historical context but are no longer the active development path.
 
-**Current state (2026-05-02):** PT-V3 (31.8M params) v2 baseline trained 25 epochs (val seg_acc 49.5%, axis_deg 38.3°, valid_acc 96.9%). Phase D pipeline integration complete: end-to-end inference, semi-automatic user annotation GUI, motion-image refinement, **D.4 geometric joint extraction** (5/6 joints recovered on test_2 vs ML's ~0/6), and side-by-side comparison-GLB exports. **D.2 retrieval abandoned** (PT-V3 global features are pose-sensitive). **D.6 joint-limits head + collision sweep is training right now**: 13-row `urdf_db.json` lookup deleted; v3 shards (889 shards / 28,400 examples / 572 robots, 5 GB) regenerated with per-joint `(lower, upper)` embedded; PT-V3 **base** (106.5M params, 3.3× the 'small' baseline) + LimitsHead training on a remote H200 (143 GB VRAM, batch=24, lr=5e-4, 50 epochs, 85% VRAM utilization); ep1 healthy. Setup notes: `setup-server.sh` (pip-based, no conda solver); torch 2.5.1+cu124 stable wheel anchor (2.6.0 pyg wheels had ABI mismatch); `--num-workers 0` due to 64 MB unprivileged container `/dev/shm`. **Next: complete the 50-ep run; rsync checkpoint local; end-to-end test on test_2 with model limits → sweep → URDF.**
+**Current state (2026-05-02):** **D.6 shipped.** PT-V3 base (106.5M params, ~3.3× the v2 small baseline) + new `LimitsHead` trained 50 epochs on remote H200 in 7.3 hr — val `seg_acc 53.45 %` (vs v2's 49.5 %), `axis_deg 33.3°` (vs 38.3°), `limits_mae 0.358` (new capability — ~21° per (lower, upper) bound for revolute joints). End-to-end on test_2 verified across three modes (full annotation → 7-link / 5-joint URDF, fresh annotation → 7-link / 4-joint URDF, pure ML zero-touch → 9-link / 7-joint URDF) — all produce realistic learned per-joint priors (e.g. shoulder ±1.71 rad, wrist [-1.63, +2.27]) instead of the old ±π fallback. **All matchmaking / DB-lookup code is purged** (`urdf_db.json`, `template_match.match()`, `robot_retrieval.py`, `urdf_database.py`, the rejected statistical-prior script — net −1836 lines). PyBullet self-collision sweep narrows model priors to the largest collision-free interval; in pure-ML mode it correctly clamped a phantom-link j3 from +2.31 rad to +0.46 rad, preventing a self-colliding URDF from shipping. **Next: optional dataset expansion (`--n-configs 200` → ~115 k examples) to close the 20.7-pt train/val seg gap, then Phase F real-scan benchmark.**
 
 ---
 
@@ -152,21 +152,27 @@ PHASE D  PIPELINE INTEGRATION
     Order: D.2 retrieval -> if low sim -> D.4 geometric extraction.
     The user-refined segmentation feeds D.4 directly.
 
-  D.6 (in progress 2026-05-01) JOINT LIMITS AS A MODEL OUTPUT:
+  D.6 (shipped 2026-05-02) JOINT LIMITS AS A MODEL OUTPUT:
     The 13-row data/urdf_db.json template lookup is deleted (it was
     a matchmaking pattern that returned the closest-DOF stranger's
-    limits for any custom robot). Replaced with a learned head:
+    limits for any custom robot). Replaced with a learned head +
+    geometry-based safety check:
       - LimitsHead in model.py predicts (lower, upper) per slot
-      - v3 training shards embed joint_limits per joint (regen in progress)
+      - v3 training shards embed joint_limits per joint
+        (889 shards / 28,400 examples / 572 robots / 5 GB)
       - smooth-L1 loss on (lower, upper), masked by joint_valid
         AND a has_limits flag so legacy v1/v2 shards don't pollute
       - PyBullet self-collision sweep at inference refines the model
         prior down to the largest collision-free interval around home,
         with adjacent-link contacts filtered (expected for revolute)
       - --collision-sweep flag in predict_urdf_interactive.py
-    Density / friction / damping / effort / velocity remain fixed
-    defaults (no static-mesh signal predicts them; future work: add
-    those heads too).
+    Final result: PT-V3 base trained 50 ep on H200, val limits_mae
+    0.358; model produces realistic priors (shoulder ±1.71, wrist
+    [-1.63, 2.27]) on test_2; sweep correctly narrows joints when
+    geometry constrains tighter than the model prior. Density /
+    friction / damping / effort / velocity remain fixed defaults
+    (no static-mesh signal predicts them; future work: add those
+    heads too).
 
 PHASE E  VLM REFINEMENT (optional)
   When model uncertainty is high or sanity checks fail:

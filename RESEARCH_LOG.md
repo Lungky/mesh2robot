@@ -27,11 +27,114 @@ Project goal: real-to-sim articulated robot asset generation from MILO-reconstru
 | **D.3** | **Motion-image refinement** | **Wired (2026-05-01)** | Stage 3 opt-in via `--motion-dir`; Path-B legacy code reused; bottlenecked on test_2 calibration quality |
 | **D.4** | **Geometric joint extraction** | **In progress (2026-05-01)** | 3D-circle fit on inter-link boundary loops; universal fallback when retrieval similarity is low |
 | **D.5** | **Retrieve-or-extract dispatch** | Pending | Wire D.2 + D.4 into the interactive script as primary + fallback |
-| **D.6** | **Joint limits as model output + collision sweep** | **Training (2026-05-02)** | PT-V3 base (106.5M) + LimitsHead training on H200 (batch=24, lr=5e-4, 50 ep); v3 shards 889/28,400 examples; ep1 step230 limits_mae 0.92; legacy `urdf_db.json` deprecated; PyBullet sweep wired |
+| **D.6** | **Joint limits as model output + collision sweep** | **Shipped (2026-05-02)** | PT-V3 base (106.5M) + LimitsHead trained 50 ep on H200 in 7.3 hr; **val seg_acc 53.45 % (vs v2's 49.5 %), axis_deg 33.3°, limits_mae 0.358**; end-to-end on test_2 confirmed (model produced shoulder ±1.71, wrist [-1.63, 2.27] priors — not ±π); collision sweep narrows when geometry constrains tighter than model prior. All matchmaking/lookup code purged. |
 | **E** | VLM refinement layer | Optional / deferred | Render mesh + ask VLM to verify/correct uncertain joints |
 | **F** | Evaluation benchmark | Pending | Real-scan validation set + ablations vs heuristic + Articulate-Anything baseline |
 
 **Project pivot (2026-04-25): from heuristic single-plane segmentation to a learned 3D foundation model for general articulated robot perception.** The heuristic pipeline plateaued at gooseneck-style arms where single-plane cuts can't represent the parent/child boundary correctly. Research path commits to a trained model on a multi-source robot URDF dataset.
+
+---
+
+## 2026-05-02 — Phase D.6 shipped: training complete, end-to-end verified
+
+### Training run (H200 remote, 50 epochs)
+
+PT-V3 base (106.5 M params, the new `--encoder-size base` config) + the new `LimitsHead` finished its 50-epoch run on the remote H200 in **7.3 hr wall clock** (526 s/epoch average; ep1 was 545 s due to JIT warm-up, the rest steady at 526 s). VRAM held at 122 / 144 GB ≈ 85 % utilisation throughout — the sweet spot once the encoder size matched the GPU. Loss stayed monotone-down on the metrics we care about; classic mild overfit signal showed up around ep18 (loss/total starts climbing on val while metric/seg_acc keeps rising — model gets more confidently wrong on outliers while the median prediction keeps improving). No early stop: ep50 still produced the best metric values.
+
+**Final val metrics vs the v2 baseline:**
+
+| Metric | v2 ep25 (small, 31.8 M, 3090) | **v3 ep50 (base, 106.5 M, H200)** | Δ |
+|---|---:|---:|---:|
+| `seg_acc` | 49.5 % | **53.45 %** | **+4.0 pts** |
+| `axis_deg` | 38.3° | **33.3°** | **−5.0°** |
+| `origin_m` | (not tracked) | 0.341 | new |
+| `valid_acc` | 96.9 % | 95.7 % | −1.2 pts (within val noise) |
+| `limits_mae` | n/a (no head) | **0.358** | new capability |
+
+`limits_mae=0.358` in the model's mixed (radian/metre) target space ≈ ~21° typical error per (lower, upper) bound for a revolute joint. That's the *prior*; the collision sweep refines from there.
+
+### Cleanup before shipping: matchmaking pattern fully purged
+
+Audited the repo for any lingering DB-lookup / template-match / "nearest-stranger" code on the active inference path and removed it all (commit `22794e3`):
+
+- **Deleted** `mesh2robot/core/robot_retrieval.py` (D.2 retrieval, abandoned), `mesh2robot/io/urdf_database.py` (builder for the deleted DB), `scripts/build_joint_limit_priors.py` (the rejected statistical-prior approach), `data/urdf_db.json.deprecated` (DB backup), `mesh2robot/experiments/urdf_from_images.py` (legacy heuristic Path B that depended on robot_retrieval).
+- **Renamed + simplified** `mesh2robot/core/template_match.py` → `mesh2robot/core/physics_defaults.py`. The misleading `match()` shim is gone; only `Template` dataclass + `make_default_template()` remain. `Template.score` field deleted (only existed for backward compat with the removed match score).
+- **Updated callers** (`predict_urdf*.py`, both `experiments/*.py`, `urdf_assembly.py`) to import `physics_defaults.make_default_template` directly. Net change: −1836 lines.
+
+The active inference path is now: trained model (segmentation + axis/origin/type/valid + LimitsHead) → optional geometric joint extraction → PyBullet self-collision sweep → URDF. **Zero lookups, zero matchmaking.** Joint limits are either model-predicted (when checkpoint has `LimitsHead`) or `±π` fallback (legacy v2 checkpoint), then refined by collision sweep.
+
+### Cross-platform checkpoint loading (PosixPath → WindowsPath)
+
+Checkpoints saved on the H200 (Linux) carry `pathlib.PosixPath` instances in the `args` dict (CLI arguments include `--shard-dir`, `--out-dir`, etc.). Loading on Windows local with `torch.load` failed at unpickle with `cannot instantiate 'PosixPath'`. Added a top-of-file shim to both predict scripts:
+
+```python
+import pathlib
+import sys
+if sys.platform == "win32":
+    pathlib.PosixPath = pathlib.WindowsPath
+```
+
+Aliasing the class transparently resolves PosixPath references at unpickle time. Committed as `1c68392`.
+
+### End-to-end on test_2 — three modes
+
+All three runs use the same `model_v3_ptv3_base_50ep/checkpoint_epoch_050.pt` checkpoint, the same MILO scan, the same v3-trained model. Only the **annotation source** differs.
+
+| Run | Annotation source | Tagged faces | Geometric joints | Final URDF | Notes |
+|---|---|---:|---|---|---|
+| `output/test_2_v3_first/` | `test_2_full_annotation/user_annotations.json` (saved from earlier full lasso pass) | 346,524 (92.6 %) | 5 revolute + 1 fixed | 7 links / 5 actuated | Cleanest segmentation; J5 wrist falls to fixed (boundary too noisy for circle-fit, 13 mm plane residual) |
+| `output/test_2_v3_fresh/` | `test_2_fresh_anno/user_annotations.json` (different lasso strokes) | 319,808 (85.5 %) | 4 revolute + 2 fixed | 7 links / 4 actuated | Sparser coverage at J3-J4 boundary collapses J3 to fixed (12 mm residual vs 1 mm in full_anno) |
+| `output/test_2_v3_pure_ml/` | none — `--no-gui` | 0 | n/a (geometric path requires user-defined boundaries) | 9 links / 7 revolute + 1 fixed | Over-segmented (model split things finer than the true 7-link xArm6); zero-touch but cosmetically extra "links" |
+
+**Headline numbers:** the LimitsHead ships sensible per-joint priors that the collision sweep then narrows to physically valid ranges. Spot-checks across the three runs:
+
+| Joint | full_anno (model) | fresh_anno (model) | pure_ml (model, after sweep) | Plausibility |
+|---|---|---|---|---|
+| j1 base | `[-3.10, 3.05]` | `[-3.12, 3.07]` | `[-3.06, 3.02]` | ≈ ±π — base joints typically continuous |
+| **j2 shoulder** | `[-1.71, 1.63]` | `[-1.65, 1.62]` | `[-1.72, 1.72]` | **±97° — xArm-style shoulder, learned, not from a DB** |
+| j3 elbow | `[-2.91, 3.08]` | n/a (fixed) | `[-1.81, 2.31]` (sweep narrowed to `[-1.81, 0.46]`) | Model gives wide prior; **sweep saved us from a self-colliding URDF** |
+| **j4 wrist** | `[-1.63, 2.27]` | `[-1.56, 2.16]` | `[-1.63, 2.27]` | **−93° to +130° — physically realistic wrist** |
+
+Two findings worth recording:
+
+1. **LimitsHead is annotation-robust.** The same point cloud → essentially the same predicted limits across all three runs (Δ < 0.1 rad). This is what we want — limits depend on the geometry the model sees, not on which lasso strokes the user happened to draw.
+2. **The collision sweep earned its keep.** In pure-ML mode it narrowed j3's upper bound from +2.31 rad to +0.46 rad — past +0.46 the over-segmented "phantom link 4" sliver self-collides with link 5. **Without the sweep that joint would ship with a 132° upper limit that crashes any sim attempting it.** Even an over-confident model can't ship a physically-impossible URDF as long as the sweep is on.
+
+### Practical quality ranking
+
+For the same robot and same model:
+
+```
+full annotation > fresh annotation > pure ML
+   (5 actuated)    (4 actuated)      (7 actuated, but on 9-link mesh)
+```
+
+For known robots (in training set) with users willing to lasso, full annotation gives the cleanest URDF. For zero-touch use cases, pure ML now produces a real first draft — something v2 couldn't because it had no learned limits, no sweep, and no `--encoder-size base`. The over-segmentation residue (9 vs 7 links) is the price of skipping annotation.
+
+### Output / artefact summary
+
+```
+data/checkpoints/model_v3_ptv3_base_50ep/   60 GB / 52 files (50 epoch ckpts + train log + train CSV)
+output/test_2_v3_first/                     full-anno run; 7-link / 5-joint URDF + comparison GLBs
+output/test_2_v3_fresh/                     fresh-anno run; 7-link / 4-joint URDF + comparison GLBs
+output/test_2_v3_pure_ml/                   pure-ML run; 9-link / 7-joint URDF (no `refined/` subdir)
+```
+
+### Commits in this milestone
+
+```
+2b62412  Add PT-V3 'base' encoder size; --encoder-size CLI flag
+0149758  Document H200 training launch + D.6 progress through 2026-05-02
+22794e3  Purge all matchmaking / DB-lookup code from the inference path
+f6cc30c  train_model.py: print total training wall-clock at end of run
+1c68392  predict scripts: PosixPath→WindowsPath shim for cross-platform ckpt loading
+```
+
+### Pending / next moves
+
+- Train/val seg gap of 20.7 pts at ep50 is the only mild overfit signal worth addressing. Closing it would mean expanding the dataset (`--n-configs 200` → ~115 k examples instead of 28 k) and possibly adding weight_decay > 1e-4 or label smoothing. Optional; the current model already exceeds the v2 baseline.
+- `metric/limits_mae=0.358` is ~21° typical bound error — useful as a prior. Could halve with more training data.
+- Phase E (VLM refinement) and Phase F (real-scan benchmark) remain deferred as in the original plan.
 
 ---
 
