@@ -149,6 +149,101 @@ def find_boundary_vertices(
     return np.asarray(mesh.vertices)[unique_v], n_edges
 
 
+def _fit_one_joint(
+    mesh: trimesh.Trimesh,
+    face_labels: np.ndarray,
+    parent_lbl: int,
+    child_lbl: int,
+    min_boundary_edges: int,
+    circularity_revolute_threshold: float,
+) -> GeometricJoint:
+    """Fit a single GeometricJoint between two given link labels.
+    Shared by the chain-order and tree-topology extractors below."""
+    verts, n_edges = find_boundary_vertices(
+        mesh, face_labels, parent_lbl, child_lbl,
+    )
+
+    if n_edges < min_boundary_edges or len(verts) < 3:
+        # No clear interface — fixed joint at midpoint of link centroids
+        parent_centroid = (np.asarray(
+            mesh.vertices[np.unique(mesh.faces[face_labels == parent_lbl])
+                          ].mean(axis=0))
+            if (face_labels == parent_lbl).any() else np.zeros(3))
+        child_centroid = (np.asarray(
+            mesh.vertices[np.unique(mesh.faces[face_labels == child_lbl])
+                          ].mean(axis=0))
+            if (face_labels == child_lbl).any() else np.zeros(3))
+        return GeometricJoint(
+            parent_label=parent_lbl, child_label=child_lbl,
+            axis=np.array([0.0, 0.0, 1.0]),
+            origin=0.5 * (parent_centroid + child_centroid),
+            radius=0.0,
+            plane_residual=float("inf"),
+            n_boundary_edges=n_edges,
+            type="fixed",
+            confidence=0.0,
+        )
+
+    center, normal, radius, plane_residual = _fit_3d_circle(verts)
+    circ = _circularity_score(verts, center, normal, radius)
+    jtype = "revolute" if circ >= circularity_revolute_threshold else "fixed"
+
+    # Orient axis from parent toward child for URDF convention
+    parent_centroid = np.asarray(mesh.vertices[
+        np.unique(mesh.faces[face_labels == parent_lbl])
+    ].mean(axis=0))
+    child_centroid = np.asarray(mesh.vertices[
+        np.unique(mesh.faces[face_labels == child_lbl])
+    ].mean(axis=0))
+    chain_dir = child_centroid - parent_centroid
+    if (chain_dir @ normal) < 0:
+        normal = -normal
+
+    return GeometricJoint(
+        parent_label=parent_lbl, child_label=child_lbl,
+        axis=normal,
+        origin=center,
+        radius=radius,
+        plane_residual=plane_residual,
+        n_boundary_edges=n_edges,
+        type=jtype,
+        confidence=circ,
+    )
+
+
+def extract_joints_for_tree(
+    mesh: trimesh.Trimesh,
+    face_labels: np.ndarray,
+    parent_child_pairs: Sequence[tuple[int, int]],
+    min_boundary_edges: int = 6,
+    circularity_revolute_threshold: float = 0.55,
+) -> list[GeometricJoint]:
+    """Fit a joint for each (parent_label, child_label) pair.
+
+    Tree-topology generalisation of `extract_joints_from_segmentation`.
+    Each pair becomes one `GeometricJoint`; the URDF assembler can
+    consume them as multi-child branches off any parent.
+
+    Parameters
+    ----------
+    mesh
+        Full input mesh (world frame).
+    face_labels
+        (F,) per-face link label.
+    parent_child_pairs
+        List of (parent_id, child_id) tuples, in any order.
+    min_boundary_edges, circularity_revolute_threshold
+        Same as `extract_joints_from_segmentation`.
+    """
+    return [
+        _fit_one_joint(
+            mesh, face_labels, int(p), int(c),
+            min_boundary_edges, circularity_revolute_threshold,
+        )
+        for p, c in parent_child_pairs
+    ]
+
+
 def extract_joints_from_segmentation(
     mesh: trimesh.Trimesh,
     face_labels: np.ndarray,
@@ -179,70 +274,10 @@ def extract_joints_from_segmentation(
     A list of `GeometricJoint`, one per adjacent pair (length =
     len(chain_order) - 1).
     """
-    out: list[GeometricJoint] = []
-    for i in range(len(chain_order) - 1):
-        parent_lbl = int(chain_order[i])
-        child_lbl = int(chain_order[i + 1])
-        verts, n_edges = find_boundary_vertices(
-            mesh, face_labels, parent_lbl, child_lbl,
-        )
-
-        if n_edges < min_boundary_edges or len(verts) < 3:
-            # No clear interface — emit a fixed joint at the midpoint of
-            # the two link centroids.
-            parent_centroid = np.asarray(
-                mesh.vertices[
-                    np.unique(mesh.faces[face_labels == parent_lbl])
-                ].mean(axis=0)
-            ) if (face_labels == parent_lbl).any() else np.zeros(3)
-            child_centroid = np.asarray(
-                mesh.vertices[
-                    np.unique(mesh.faces[face_labels == child_lbl])
-                ].mean(axis=0)
-            ) if (face_labels == child_lbl).any() else np.zeros(3)
-            out.append(GeometricJoint(
-                parent_label=parent_lbl, child_label=child_lbl,
-                axis=np.array([0.0, 0.0, 1.0]),
-                origin=0.5 * (parent_centroid + child_centroid),
-                radius=0.0,
-                plane_residual=float("inf"),
-                n_boundary_edges=n_edges,
-                type="fixed",
-                confidence=0.0,
-            ))
-            continue
-
-        center, normal, radius, plane_residual = _fit_3d_circle(verts)
-        circ = _circularity_score(verts, center, normal, radius)
-
-        # Determine joint type. Today we only emit revolute or fixed;
-        # prismatic vs revolute disambiguation needs motion observation.
-        if circ < circularity_revolute_threshold:
-            jtype = "fixed"
-        else:
-            jtype = "revolute"
-
-        # Orient the axis so it points from parent toward child, so URDF
-        # rotation conventions match. We do this by checking the signed
-        # projection of (child_centroid - parent_centroid) onto the axis.
-        parent_centroid = np.asarray(mesh.vertices[
-            np.unique(mesh.faces[face_labels == parent_lbl])
-        ].mean(axis=0))
-        child_centroid = np.asarray(mesh.vertices[
-            np.unique(mesh.faces[face_labels == child_lbl])
-        ].mean(axis=0))
-        chain_dir = child_centroid - parent_centroid
-        if (chain_dir @ normal) < 0:
-            normal = -normal
-
-        out.append(GeometricJoint(
-            parent_label=parent_lbl, child_label=child_lbl,
-            axis=normal,
-            origin=center,
-            radius=radius,
-            plane_residual=plane_residual,
-            n_boundary_edges=n_edges,
-            type=jtype,
-            confidence=circ,
-        ))
-    return out
+    pairs = [(int(chain_order[i]), int(chain_order[i + 1]))
+             for i in range(len(chain_order) - 1)]
+    return extract_joints_for_tree(
+        mesh, face_labels, pairs,
+        min_boundary_edges=min_boundary_edges,
+        circularity_revolute_threshold=circularity_revolute_threshold,
+    )

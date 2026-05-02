@@ -372,6 +372,7 @@ def build_urdf_from_predictions(
     pred_limits: np.ndarray | None = None,
     collision_sweep: bool = False,
     sweep_steps: int = 64,
+    topology_mode: str = "serial",
 ) -> Path | None:
     """Build a URDF from face labels + joint predictions. Mirrors
     `predict_urdf.py`'s steps 4–8.
@@ -405,49 +406,113 @@ def build_urdf_from_predictions(
         print(f"  Need >= 2 links to assemble; got {len(per_link_meshes)}. Skipping.")
         return None
 
-    link_ids_in_order = sorted(
-        per_link_meshes.keys(),
-        key=lambda lid: float(per_link_meshes[lid].centroid[2]),
-    )
-    print(f"  Links ordered by Z (low → high): {link_ids_in_order}")
+    # ──────────────────────────────────────────────────────────────────
+    # Chain / topology decision (Phase E.2)
+    # ──────────────────────────────────────────────────────────────────
+    # Three modes:
+    #   serial — Z-sort links, emit a single chain (legacy behaviour;
+    #            correct for industrial arms).
+    #   tree   — infer parent-child via face-adjacency BFS from a
+    #            largest-mesh root (correct for humanoids, quadrupeds).
+    #   auto   — infer tree, but if the result is a path, fall back to
+    #            serial Z-sort for stable chain ordering.
+    # Resulting structures (used downstream):
+    #   link_ids_in_chain_or_bfs : ordered list of link IDs (drives body_id)
+    #   pair_list                : list of (parent_lbl, child_lbl) tuples
+    if topology_mode in ("tree", "auto"):
+        from mesh2robot.core.topology import infer_topology_auto
+        # In `auto`, prefer lowest-Z root: for serial robots this matches the
+        # legacy serial-mode chain (base → tip), so a chain stays a chain.
+        # In `tree`, prefer largest-mesh root: for humanoids/quadrupeds the
+        # torso is the natural branching point.
+        prefer_z = (topology_mode == "auto")
+        topo = infer_topology_auto(
+            mesh, face_labels, per_link_meshes,
+            prefer_lowest_z_root=prefer_z,
+        )
+        chain_order = topo.chain_order()
+        if topology_mode == "auto" and chain_order is not None:
+            print(f"  Topology=auto → graph is serial; using Z-sorted chain")
+            link_ids_in_chain_or_bfs = sorted(
+                per_link_meshes.keys(),
+                key=lambda lid: float(per_link_meshes[lid].centroid[2]),
+            )
+            pair_list = [
+                (link_ids_in_chain_or_bfs[i], link_ids_in_chain_or_bfs[i + 1])
+                for i in range(len(link_ids_in_chain_or_bfs) - 1)
+            ]
+        else:
+            print(f"  Topology=tree, root=link_{topo.root}, "
+                  f"{topo.n_joints} joints inferred from face adjacency")
+            print(topo)
+            # BFS-order the links so parent body_id < child body_id (URDF
+            # convention). Root first.
+            link_ids_in_chain_or_bfs = [topo.root]
+            queue = [topo.root]
+            while queue:
+                cur = queue.pop(0)
+                for ch in topo.children_of.get(cur, []):
+                    link_ids_in_chain_or_bfs.append(ch)
+                    queue.append(ch)
+            pair_list = [
+                (parent, child) for child, parent in topo.parent_of.items()
+            ]
+    else:
+        # serial (legacy)
+        link_ids_in_chain_or_bfs = sorted(
+            per_link_meshes.keys(),
+            key=lambda lid: float(per_link_meshes[lid].centroid[2]),
+        )
+        print(f"  Links ordered by Z (low → high): {link_ids_in_chain_or_bfs}")
+        pair_list = [
+            (link_ids_in_chain_or_bfs[i], link_ids_in_chain_or_bfs[i + 1])
+            for i in range(len(link_ids_in_chain_or_bfs) - 1)
+        ]
 
-    # Phase D.4 — geometric joints (computed once, indexed by chain_i)
-    geometric_joints = None
+    # Backwards-compat alias used by old code paths below.
+    link_ids_in_order = link_ids_in_chain_or_bfs
+
+    # Phase D.4 — geometric joints (now keyed by (parent, child) pair)
+    geometric_joints_by_pair: dict[tuple[int, int], object] | None = None
     if use_geometric_joints:
         try:
             from mesh2robot.core.geometric_joints import (
-                extract_joints_from_segmentation,
+                extract_joints_for_tree,
             )
-            geometric_joints = extract_joints_from_segmentation(
-                mesh, face_labels, link_ids_in_order,
+            joints_list = extract_joints_for_tree(
+                mesh, face_labels, pair_list,
             )
-            n_rev = sum(1 for j in geometric_joints if j.type == "revolute")
-            n_fixed = sum(1 for j in geometric_joints if j.type == "fixed")
-            print(f"  GEOMETRIC JOINTS: {len(geometric_joints)} fitted "
+            geometric_joints_by_pair = {
+                (j.parent_label, j.child_label): j for j in joints_list
+            }
+            n_rev = sum(1 for j in joints_list if j.type == "revolute")
+            n_fixed = sum(1 for j in joints_list if j.type == "fixed")
+            print(f"  GEOMETRIC JOINTS: {len(joints_list)} fitted "
                   f"({n_rev} revolute, {n_fixed} fixed)")
         except Exception as e:
             print(f"  (geometric joint extraction failed: {e}; falling back to ML)")
-            geometric_joints = None
+            geometric_joints_by_pair = None
 
     valid_idx = np.where(pred_valid)[0]
     valid_idx_by_z = sorted(
         valid_idx, key=lambda j: float(pred_origins_world[j, 2]),
     )
-    n_joints_needed = len(link_ids_in_order) - 1
+    n_joints_needed = len(pair_list)
     valid_idx_by_z = valid_idx_by_z[:n_joints_needed]
 
     body_id_of_link = {lid: i for i, lid in enumerate(link_ids_in_order)}
     je_list: list[JointEstimate] = []
-    # Per-chain-slot model-predicted limits (or None to fall through to ±π).
+    # Per-joint model-predicted limits (or None to fall through to ±π).
     chain_limits: list[tuple[float, float] | None] = []
-    for chain_i in range(n_joints_needed):
+    for chain_i, (parent_lbl, child_lbl) in enumerate(pair_list):
         # Source priority: geometric > motion > ML
-        if geometric_joints is not None and chain_i < len(geometric_joints):
-            gj = geometric_joints[chain_i]
+        gj = (geometric_joints_by_pair or {}).get((parent_lbl, child_lbl))
+        if gj is not None:
             axis_use = np.asarray(gj.axis, dtype=np.float64)
             origin_use = np.asarray(gj.origin, dtype=np.float64)
             jt = gj.type
-            print(f"  joint_{chain_i+1}: GEOMETRIC  type={jt}  "
+            print(f"  joint_{chain_i+1} (link_{parent_lbl}→link_{child_lbl}): "
+                  f"GEOMETRIC  type={jt}  "
                   f"axis={np.round(axis_use, 3).tolist()}  "
                   f"origin={np.round(origin_use, 3).tolist()}  "
                   f"(conf={gj.confidence:.2f}, r={gj.radius:.3f}m, "
@@ -480,7 +545,7 @@ def build_urdf_from_predictions(
         # geometric/motion branches don't observe ML's slot indexing).
         slot_for_limits = None
         if pred_limits is not None and pred_limits.shape[0] > 0:
-            if (geometric_joints is None and motion_overrides is None
+            if (gj is None and motion_overrides is None
                     and chain_i < len(valid_idx_by_z)):
                 slot_for_limits = int(valid_idx_by_z[chain_i])
             elif chain_i < pred_limits.shape[0]:
@@ -496,8 +561,8 @@ def build_urdf_from_predictions(
                 upper_use = hi
         chain_limits.append((lower_use, upper_use))
         je_list.append(JointEstimate(
-            parent_body=chain_i,
-            child_body=chain_i + 1,
+            parent_body=body_id_of_link[parent_lbl],
+            child_body=body_id_of_link[child_lbl],
             type=jt,
             axis=axis_use,
             origin=origin_use,
@@ -1519,6 +1584,15 @@ def main() -> None:
     parser.add_argument("--sweep-steps", type=int, default=64,
                         help="Samples per side per joint for --collision-sweep. "
                              "Higher = tighter bound, slower (default 64).")
+    parser.add_argument("--topology",
+                        choices=["serial", "tree", "auto"],
+                        default="serial",
+                        help="Kinematic chain layout. 'serial' (default) "
+                             "Z-sorts links into a single chain — correct for "
+                             "industrial arms. 'tree' infers parent-child via "
+                             "face-adjacency BFS — correct for humanoids, "
+                             "quadrupeds, multi-arm rigs. 'auto' tries tree "
+                             "and falls back to serial when the graph is a path.")
     parser.add_argument("--camera-intrinsics", type=Path, default=None,
                         help="Path to calibration.json (fx/fy/cx/cy/dist). "
                              "If omitted but --motion-dir is set, defaults "
@@ -1680,6 +1754,7 @@ def main() -> None:
         pred_limits=pred_limits,
         collision_sweep=args.collision_sweep,
         sweep_steps=args.sweep_steps,
+        topology_mode=args.topology,
     )
     if orig_urdf is not None:
         print(f"  Wrote {orig_urdf}")
@@ -1766,6 +1841,7 @@ def main() -> None:
         pred_limits=pred_limits,
         collision_sweep=args.collision_sweep,
         sweep_steps=args.sweep_steps,
+        topology_mode=args.topology,
     )
     if refined_urdf is not None:
         print(f"  Wrote {refined_urdf}")
