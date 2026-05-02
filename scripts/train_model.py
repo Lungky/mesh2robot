@@ -85,6 +85,13 @@ def main() -> None:
                         help="Preload all shards into RAM at startup (5 GB). "
                              "Eliminates per-batch disk I/O — significant speedup "
                              "for any training run, at the cost of ~5 GB RAM.")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Resume from a previously-saved checkpoint. "
+                             "Reads model + optimizer state, sets the next "
+                             "epoch to ckpt['epoch']+1, and seeks the cosine "
+                             "scheduler forward to ckpt['global_step']. "
+                             "Required arch (--encoder, --encoder-size) must "
+                             "match the saved checkpoint.")
     parser.add_argument("--canonical-manifest", type=Path, default=None,
                         help="Path to research manifest (e.g. "
                              "data/robot_manifest_research.json). When given, "
@@ -175,8 +182,34 @@ def main() -> None:
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr,
                               weight_decay=args.weight_decay)
+
+    # --- Resume support: load weights + optim state + advance the step counter.
+    # Must happen BEFORE building the LR scheduler so we can seek it forward to
+    # the saved global_step (cosine annealing's last_epoch parameter is steps-based
+    # in this configuration since T_max is in steps).
+    start_epoch = 1
+    resume_global_step = 0
+    if args.resume is not None:
+        print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Sanity: same arch
+        ckpt_args = ckpt.get("args", {})
+        for k in ("encoder", "encoder_size"):
+            if ckpt_args.get(k) is not None and ckpt_args.get(k) != getattr(args, k):
+                print(f"  WARNING: --{k.replace('_','-')} mismatch "
+                      f"(ckpt={ckpt_args.get(k)!r}, current={getattr(args, k)!r}); "
+                      f"load_state_dict may fail.")
+        model.load_state_dict(ckpt["model_state_dict"])
+        optim.load_state_dict(ckpt["optim_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        resume_global_step = int(ckpt.get("global_step", 0))
+        print(f"  resumed: starting at epoch {start_epoch}, "
+              f"global_step={resume_global_step}")
+
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=max(1, args.epochs * len(train_loader)),
+        optim,
+        T_max=max(1, args.epochs * len(train_loader)),
+        last_epoch=resume_global_step - 1 if resume_global_step > 0 else -1,
     )
     loss_w = LossWeights()
 
@@ -185,8 +218,8 @@ def main() -> None:
     log_rows: list[dict] = []
 
     t_run_start = time.time()
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    global_step = resume_global_step
+    for epoch in range(start_epoch, args.epochs + 1):
         # --- train ---
         model.train()
         t_epoch = time.time()
