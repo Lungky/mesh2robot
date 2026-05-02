@@ -45,155 +45,264 @@ mesh2robot fills this gap by combining:
 
 ## 3. End-to-end pipeline
 
-The **active** path as of 2026-04-25 is the learned-model path: a foundation model trained on ~925 reference robot URDFs predicts segmentation + joint structure from any input mesh. The earlier heuristic paths (A and B below) are retained as comparison baselines.
+The **active** path as of 2026-04-25 is the learned-model path: a Point Transformer V3 trained on synthetic articulations of ~572 reference robots predicts segmentation, joint structure, and joint limits from any input mesh. PyBullet self-collision sweep narrows learned priors to physically valid ranges. The earlier heuristic paths (A and B in Section 3.7 below) are retained as comparison baselines but are no longer the development frontier.
+
+### 3.1  Phase A — Multi-source URDF dataset (shipped 2026-04-26)
+
+**What it produces.** A canonical, deduped, license-tagged manifest of robot URDFs/MJCFs covering the breadth of the robotics ecosystem.
+
+**Pipeline.**
+```
+upstream repos (7) ──► raw_robots/   crawl + clone (offline, one-time)
+       │                   │ 2,020 raw URDF/MJCF/SDF entries
+       ▼                   ▼
+build_robot_manifest.py ──► robot_manifest.json
+       │                       │ 572 trainable (loaded OK + actuated joints + ≥80% meshes resolve)
+       ▼                       ▼
+build_research_manifest.py ──► robot_manifest_research.json
+       │                              │ 371 canonical (union-find dedup)
+       │                              │ + license per directory
+       │                              │ + quality_tier (curated CAD vs xacro vs demo)
+       │                              │ + scale_class (compact/tabletop/fullsize/huge/unit_bug)
+       │                              │ + AABB / mesh_bytes / joint_range_total
+       ▼                              ▼
+summarize_manifest.py ──► canonical_robots.{md,csv}
+                          (paper-appendix-ready table of every canonical robot)
+```
+
+**Sources crawled.** MuJoCo Menagerie, bullet3, urdf_files_dataset, robot-assets, robosuite, Gymnasium-Robotics, ROS-Industrial. Includes xArm6 (3 variants in bullet3), xArm7 (4 in Menagerie/robosuite), Panda, UR5/10/e, IIWA, Sawyer, Yumi, Spot, Atlas, Unitree H1/G1/Go2, dexterous hands (LEAP, Adroit, ShadowHand), grippers (Robotiq, UMI), quadrupeds (Anymal, Barkour), humanoids (Talos, Tiago).
+
+**Dedup signatures (3-key union-find).** Same robot from different sources collapses to one canonical instance. (a) `(family, leaf-filename, dof)` matches identically-named Pandas across Menagerie + robot-assets + robosuite. (b) `(normalized-path-tail, dof)` matches re-bundled paths even when family inference fell back to source name. (c) `(menagerie-dir, dof)` collapses Menagerie's `<robot>.xml` + `scene.xml` + `<robot>_mjx.xml` variants — they're the same physical robot.
+
+**Quality guardrails.**
+- `unit_bug` flag for any URDF with link-origin AABB > 50 m (catches mm-encoded chains). **Zero unit-bug entries in the canonical set.**
+- License-per-directory parsing of Menagerie's combined LICENSE file → per-robot Apache-2.0 / BSD-3 / CC-BY / MIT attribution.
+- `scale_class` (compact / tabletop / fullsize / huge) prevents matching a 6-DOF gripper finger to a 6-DOF arm.
+
+---
+
+### 3.2  Phase B — Synthetic data generator (shipped 2026-04-26; v4 expanding)
+
+**What it produces.** Training shards: (point_cloud, per-point link labels, per-joint targets including learned `(lower, upper)` limits) tuples, sampled from the canonical robots at random poses.
+
+**Per-example pipeline (one robot, one config, one shard entry).**
+```
+LoadedRobot                              random joint config
+(URDF or MJCF)                           uniform within (lower, upper)
+       │                                          │
+       └──────────► articulate_and_label ◄────────┘
+                    (urdf_loader.py / mjcf_loader.py)
+                              │
+                              ▼
+       ┌──── combined trimesh (world frame, all link visuals concatenated)
+       ├──── vertex_labels[V]               per-vertex link index
+       ├──── joint_axes_world[J, 3]          unit vector at this articulation
+       ├──── joint_origins_world[J, 3]       pivot in world frame
+       ├──── joint_types[J]                  int (revolute=0, continuous=1, prismatic=2, fixed=3)
+       ├──── joint_topology[J, 2]            (parent_link_idx, child_link_idx)
+       └──── joint_limits[J, 2]              (lower, upper) — from URDF source [v3+]
+                              │
+                              ▼
+                     sample_point_cloud
+                     uniform-area, 16,384 points
+                              │
+                              ▼
+                       apply_augment
+       Gaussian vertex noise σ ∈ [0.5, 5] mm     (sensor noise)
+       Cluster hole-punching 5-15% drop          (MILO occlusion)
+       Random rigid transform + scale ±20%       (camera-frame variation)
+                              │
+                              ▼
+                  pack into shard (.npz)
+```
+
+**Why "synthetic" but the robots are real.** The robots' geometry, joint structure, and limits come from real manufacturer URDFs in the manifest. The *poses* are random, the *point clouds* are sampled (not LiDAR'd), the *noise* is simulated. The model learns to see real MILO scans because the synthetic noise distribution matches MILO's typical artefacts.
+
+**v3 dataset (used for the shipped checkpoint):**
+- 50 random configs × 572 robots = **28,400 examples** (URDF: 17,450 / MJCF: 10,950)
+- 5.0 GB on disk (compressed npz shards, 32 examples per shard)
+- Includes `joint_limits` field (added 2026-05-02 for the LimitsHead training)
+
+**v4 dataset (in progress):** 200 configs × 572 robots ≈ **115k examples** (~20 GB). Goal: close the train/val seg gap (20.7 pts at v3 ep50 → target ≤12 pts).
+
+**The "~1M target" in the original spec.** Original arithmetic was `925 robots × 200 configs × 5 augmentations ≈ 925k`. Two reductions vs that target: (a) post-dedup, 925 became 572 unique canonical robots; (b) augmentations are applied *inline* (one per example), not as multiplicative expansion. v4 brings us to 115k — about 12% of the original ambition, but enough for a 106M-param model.
+
+---
+
+### 3.3  Phase C — Foundation model training (v3 shipped 2026-05-02)
+
+**Architecture.** Point Transformer V3 encoder + multi-task heads predicting per-vertex segmentation and per-joint properties. Built on the [Pointcept](https://github.com/Pointcept/Pointcept) PT-V3 backbone, vendored into `mesh2robot/model/ptv3/`.
+
+**Two encoder sizes (`--encoder-size`):**
+
+| Size | Params | enc_channels | enc_depths | Trained on | VRAM at training |
+|---|---:|---|---|---|---|
+| `small` | 31.8 M | (32, 64, 128, 256, 384) | (2,2,2,4,2) | local 3090 | ~10 GB at batch 32 |
+| `base` (current) | 106.5 M | (64, 128, 256, 384, 512) | (2,2,4,6,2) | remote H200 | ~122 GB at batch 24 |
+
+**Heads** (all in `mesh2robot/model/model.py`):
 
 ```
-═══════════════════════════════════════════════════════════════
-  ACTIVE PATH (2026-04-25+) — LEARNED 3D FOUNDATION MODEL
-═══════════════════════════════════════════════════════════════
+PT-V3 encoder ──► per_point[B, N, F]
+                  global_feat[B, F]
+                            │
+            ┌───────────────┼─────────────────┐
+            ▼               ▼                 ▼
+       SegmentationHead  JointHead         (mass/inertia head — future work)
+       per_point + g     g + slot_emb[J_MAX]
+            │               │
+            ▼               ├──► axis[B, J, 3]         unit vec, sign-invariant CE-cos loss
+       seg_logits           ├──► origin[B, J, 3]       smooth-L1 in metres
+       [B, N, K=64]         ├──► type_logits[B, J, 6]  CE over 6 joint types
+                            ├──► valid_logit[B, J]     BCE — does this slot exist?
+                            └──► limits[B, J, 2]       smooth-L1 on (lower, upper) [v3+]
+```
 
+**Loss weights** (`LossWeights` in `losses.py`): `seg=1.0, axis=1.0, origin=1.0, type=0.5, valid=0.5, limits=0.5`. Limits loss is masked by `joint_valid AND has_limits` so legacy v1/v2 shards (no limits) safely contribute nothing.
+
+**Training run history.**
+
+| Run | Encoder | Dataset | Hardware | Wall | Final val |
+|---|---|---|---|---|---|
+| v1 (PointNet baseline) | 0.5 M | v0 shards | local 3090 | ~5 min/50 ep | superseded |
+| v2 (2026-04-28) | small (31.8 M) | v1 shards (no limits) | local 3090 | ~30 min / 25 ep | seg 49.5%, axis 38.3°, valid 96.9% |
+| **v3 (2026-05-02)** | **base (106.5 M)** | **v3 shards (28,400 with limits)** | **remote H200** | **7.3 hr / 50 ep** | **seg 53.45%, axis 33.3°, valid 95.7%, limits_mae 0.358** |
+| v4 (in progress) | base (106.5 M) | v4 shards (~115k with limits) | remote H200 | ~28 hr est. / 50 ep | TBD |
+
+**Future heads** (not yet implemented): per-link mass / inertia regressor, friction / damping regressor. These are non-learnable from a static mesh signal alone (need system identification), so they currently come from fixed conservative defaults in `physics_defaults.py`.
+
+---
+
+### 3.4  Phase D — Inference pipeline (D.1, D.4, D.6 shipped; D.2 abandoned; D.3 wired-but-deferred; D.5 superseded)
+
+**Master inference flow** (one invocation of `scripts/predict_urdf_interactive.py`):
+
+```
 INPUTS
-  - User MILO scan (any robot — arm, gripper, humanoid, quadruped, ...)
-  - Optional: per-joint motion observations (for axis disambiguation)
-  - Optional: VLM refinement queries
+  --mesh                     MILO scan (.obj / .ply)
+  --mesh-to-world            optional (4×4) transform .npy
+  --checkpoint               trained PT-V3 .pt
+  --user-annotations         optional pre-saved annotations.json
+  --motion-dir               optional per-joint photo pairs (D.3, off by default)
+  --geometric-joints         flag — D.4 path on/off
+  --collision-sweep          flag — D.6 sweep on/off
 
-PHASE A  MULTI-SOURCE URDF DATASET (done)
-  - Crawl Menagerie + bullet3 + urdf_files_dataset + robot-assets +
-    robosuite + Gymnasium-Robotics + ROS-Industrial repos
-  - 2020 raw URDF/MJCF/SDF entries
-  - 572 trainable (loaded ok + actuators + meshes resolve)
-  - 371 canonical after union-find dedup over (family, leaf, dof) +
-    (path-tail, dof) + Menagerie-dir signatures
-  - Per-canonical metadata: license, fidelity_class, scale_class
-    (link-origin AABB-derived), joint_range_total, mesh_bytes_total,
-    aabb_extent_m
-  - Zero unit-bug URDFs (mm-encoded chain >50 m) in the canonical set
-  - Manifest at data/robot_manifest_research.json
-  - Includes xArm6 (3 variants in bullet3), xArm7 (4 variants in
-    Menagerie/robosuite), Panda, UR5/10/e, IIWA, Sawyer, Yumi, Spot,
-    Atlas, Unitree H1/G1/Go2, etc.
+(0) MESH PREP
+    load OBJ ──► trimesh
+    apply T_cleaned_to_original (puts mesh in MILO's world frame)
+    sample 16,384 points (uniform area)
+    normalise to unit ball (centroid-shift, p99-radius scale)
 
-PHASE B  SYNTHETIC DATA GENERATOR (training-time)
-  for each trainable URDF in manifest:
-    for each random joint config (within limits, self-collision filtered):
-      FK + concat per-link meshes -> combined mesh + per-vertex link labels
-      Extract joint axes/origins/types in world frame
-      Sample 16k surface point cloud
-      Apply augmentations:
-        Gaussian vertex noise sigma in [0.5, 5] mm
-        Cluster hole-punching (5-15% drop, simulating MILO occlusion)
-        Random rigid transform + scale +/- 20%
-      Save (point_cloud, vertex_labels, joint_axes, joint_origins, joint_types)
-  Target: ~1M training examples
+(1) USER ANNOTATION (Stage 1, default ON)
+    if --user-annotations <path>:
+        load saved annotations.json (face_idx → link_id)
+    elif not --no-gui:
+        open PyVista viewer
+        TAB cycles modes:  Rect → Lasso → Camera
+        digit 0-9 labels current selection as link N
+        every digit press persists to user_annotations.json
+        SPACE commits → ML runs
+    else:
+        skip — pure ML mode
 
-PHASE C  FOUNDATION MODEL TRAINING
-  Backbone: Point Transformer V3 (~500M-1B params)
-  Pretraining: masked point modeling on full dataset (SSL)
-  Fine-tuning heads (multi-task):
-    1. robot type classifier
-    2. articulation graph predictor (link/joint topology)
-    3. per-vertex link segmentation
-    4. per-joint axis + origin regression
-    5. per-joint type classifier
-    6. per-link mass / inertia regressor
-  Hardware: NVIDIA RTX 3090 (24 GB VRAM, local workstation —
-            i9-11900KF, 64 GB RAM)
-            Sufficient for PointNet baseline (~minutes per 50 epochs)
-            and PT-V3 medium ~100M params (~30 min per 50 epochs);
-            larger models (~500M+) are tractable in ~1-2 hr per run.
-  Output: trained checkpoint
+(2) ML INFERENCE (Stage 2, always)
+    PT-V3 forward pass (single example, batch=1)
+      ── pred_seg[N]              per-point cluster id
+      ── pred_axes[J_MAX, 3]      world-frame unit vectors
+      ── pred_origins[J_MAX, 3]   world-frame pivots
+      ── pred_types[J_MAX]        joint type ints
+      ── pred_valid[J_MAX]        sigmoid > 0.5 → joint exists
+      ── pred_limits[J_MAX, 2]    (lower, upper) — only if checkpoint has LimitsHead
 
-PHASE D  PIPELINE INTEGRATION
-  D.1 (done) End-to-end inference path:
-    user mesh -> 16k point cloud -> PT-V3 -> 6 head outputs
-    -> Phase 5 URDF assembly
-    Implemented in scripts/predict_urdf.py and the interactive
-    semi-auto variant scripts/predict_urdf_interactive.py
-    (pre-select GUI: Rect/Lasso/Camera Tab cycle, persisted
-    annotations, strict-mode merge with 30%-coverage propagation,
-    in-process ML+URDF after SPACE; auto-emits side-by-side
-    comparison GLBs at output root: user_annotation.glb (rough
-    user coverage) + refined_assembled.glb (final URDF with FK))
+    project_labels_to_faces (k-NN from sampled points to mesh faces)
+      ── face_labels[F]            per-face cluster id
 
-  D.2 (next) RETRIEVAL FOR KNOWN ROBOTS:
-    Pre-compute PT-V3 global features for each of the 371 canonical
-    robots once -> data/canonical_embeddings.npy.
-    At inference: compute input embedding, cosine-similarity vs
-    canonicals; if max similarity > tau (default 0.85):
-      pose-align canonical URDF to input via Procrustes / ICP
-      emit canonical URDF (exact joints, exact masses)
-    Else: fall through to D.3 / D.4 below.
-    Effect: for known robots the joint axis error drops to ~0
-    (uses manufacturer's URDF directly).
+(3) STRICT-MODE MERGE (when user annotated)
+    For each ML cluster:
+      if user covered ≥30% of its faces → entire cluster takes user label
+                                          (handles user "rough hint")
+      else                              → user faces become hard override,
+                                          remaining faces get fresh label
+    Output: refined_face_labels[F] — every face has a user-or-ML label
 
-  D.3 (already wired) MOTION-IMAGE REFINEMENT (Stage 3, opt-in):
-    --motion-dir flag points at motion/joint_<N>/state*.png|jpg
-    Per-joint image-pair RANSAC + PnP via legacy Path-B code
-    Sub-degree axis precision when calibration is good.
-    Currently failing on test_2 because calibration.json is a
-    rough guess; deferred until proper checkerboard calibration.
+(4) MOTION-IMAGE REFINEMENT (Stage 3, opt-in via --motion-dir)
+    Per-joint photo pairs run through legacy Path-B image RANSAC + PnP
+    Outputs (axis, origin) overrides keyed by chain index.
+    Currently bottlenecked on test_2 by rough calibration.json — deferred.
 
-  D.4 (next) GEOMETRIC JOINT EXTRACTION (universal fallback):
-    For each adjacent (link_i, link_{i+1}) pair:
-      Find boundary loop via face-adjacency in the original mesh
-      Fit a 3D circle (SVD plane fit + algebraic 2D fit)
-      circle_normal -> joint axis
-      circle_center -> joint origin
-      Joint type from boundary shape:
-        circular -> revolute
-        planar straight -> prismatic
-        diffuse / no clear loop -> fixed
-    Independent of the ML joint head; quality scales with
-    segmentation quality (so benefits from D.1's semi-auto user
-    annotation directly).
+(5) URDF ASSEMBLY (Stage 4, always)
+    split_mesh_by_face_labels                     → per-link visual meshes
+    sort link_ids by Z-centroid                    → chain order
+    for each adjacent (parent, child) in chain:
+        if --geometric-joints AND user-annotated:
+            ── walk face_adjacency, find boundary edges
+            ── fit 3D circle to boundary verts (PCA plane + algebraic 2D fit)
+            ── axis = circle normal, origin = circle center
+            ── type = revolute if circularity > 0.55 else fixed
+            ── (D.4 — geometric joints, source of truth)
+        elif joint in motion_overrides:
+            use motion-image (axis, origin)        (D.3, where it succeeded)
+        else:
+            use ML's predicted slot                (fallback)
+        build JointEstimate(parent, child, axis, origin, type)
+        attach (lower, upper) prior:
+            if model has LimitsHead:               ── slot_for_limits = matched
+                use pred_limits[slot_for_limits]
+            else:
+                use ±π fallback
 
-  D.5 (next) DISPATCH WIRING:
-    Add --use-retrieval flag to predict_urdf_interactive.py.
-    Order: D.2 retrieval -> if low sim -> D.4 geometric extraction.
-    The user-refined segmentation feeds D.4 directly.
+    template = make_default_template(dof)         (fixed physics: density 2700 kg/m³,
+                                                    friction 0.5, damping 0.1, ...)
+    inertials = compute_link_inertials(per_link_meshes, density)
 
-  D.6 (shipped 2026-05-02) JOINT LIMITS AS A MODEL OUTPUT:
-    The 13-row data/urdf_db.json template lookup is deleted (it was
-    a matchmaking pattern that returned the closest-DOF stranger's
-    limits for any custom robot). Replaced with a learned head +
-    geometry-based safety check:
-      - LimitsHead in model.py predicts (lower, upper) per slot
-      - v3 training shards embed joint_limits per joint
-        (889 shards / 28,400 examples / 572 robots / 5 GB)
-      - smooth-L1 loss on (lower, upper), masked by joint_valid
-        AND a has_limits flag so legacy v1/v2 shards don't pollute
-      - PyBullet self-collision sweep at inference refines the model
-        prior down to the largest collision-free interval around home,
-        with adjacent-link contacts filtered (expected for revolute)
-      - --collision-sweep flag in predict_urdf_interactive.py
-    Final result: PT-V3 base trained 50 ep on H200, val limits_mae
-    0.358; model produces realistic priors (shoulder ±1.71, wrist
-    [-1.63, 2.27]) on test_2; sweep correctly narrows joints when
-    geometry constrains tighter than the model prior. Density /
-    friction / damping / effort / velocity remain fixed defaults
-    (no static-mesh signal predicts them; future work: add those
-    heads too).
+    ── write URDF v1 to refined/robot.urdf
 
-PHASE E  VLM REFINEMENT (optional)
-  When model uncertainty is high or sanity checks fail:
-    Render mesh from 4 canonical angles
-    Ask GPT-4V / Claude / Gemini:
-      "this is a 3D mesh of a robot. Joint X is predicted at position Y
-       with axis Z. Is this consistent with the visible geometry? Suggest
-       corrections."
-    Apply suggested corrections to the URDF
+(6) COLLISION SWEEP (Stage 5, opt-in via --collision-sweep) — D.6
+    PyBullet load URDF v1 with USE_SELF_COLLISION
+    Disable adjacent (parent, grandparent) collision pairs
+        (those contacts are expected for revolute joints)
+    For each actuated joint:
+        sweep 0 → upper_prior in N steps; first self-collision step → upper bound
+        sweep 0 → lower_prior in N steps; first self-collision step → lower bound
+        result = (lower_safe, upper_safe) ⊆ (lower_prior, upper_prior)
+    Re-assemble URDF v2 with refined limits → refined/robot.urdf  (overwrite)
 
-PHASE F  EVALUATION
-  Real-scan benchmark (MILO scans of 3-5 different robots)
-  Per-vertex segmentation IoU
-  Per-joint axis angle error / origin distance error
-  Comparison to: heuristic baseline (Path B), Articulate-Anything,
-  PARIS (where applicable), URDFormer
+(7) COMPARISON GLB EXPORT
+    user_annotation.glb          rough user lasso coverage, untouched faces grey
+    refined_assembled.glb        refined URDF with FK applied, link-coloured
+    (both in world frame so they line up spatially in any GLB viewer)
 ```
 
-### Legacy heuristic paths (retained for historical context)
+**File outputs.** Every successful run produces:
+```
+output/<name>/
+├── original/robot.urdf            pure-ML URDF (no user input applied)
+├── refined/robot.urdf             user + geometric + sweep refined URDF
+├── user_annotation.glb            rough annotation visualisation
+└── refined_assembled.glb          final URDF with FK applied
+```
 
-Two earlier paths converge at Phase 4. **Path B (single-mesh + per-joint photos)** is the heuristic real-scan path implemented through 2026-04-24; **Path A (K pose meshes)** is the original roadmap and is validated end-to-end only on synthetic pose meshes.
+**D.2 retrieval — abandoned.** Originally planned: PT-V3 global features + cosine sim against 371 canonical embeddings, return manufacturer's URDF on high similarity. Built and tested 2026-05-01: ranked KUKA IIWA above the actual xArm6 input on test_2 (sim 0.940 vs 0.78 for the correct match). PT-V3's pooled global features are pose-sensitive and biased toward over-represented training robots. Removed; `mesh2robot/core/robot_retrieval.py` deleted in the 2026-05-02 cleanup.
+
+**D.5 dispatch wiring — superseded.** Original plan: retrieval first, geometric extraction as fallback. Since D.2 was abandoned, the dispatch became the in-line precedence chain inside `build_urdf_from_predictions`: **geometric > motion-image > ML**, with model-predicted limits feeding all three.
+
+---
+
+### 3.5  Phase E — VLM refinement (deferred)
+
+Render mesh from 4 canonical angles, ask GPT-4V / Claude / Gemini whether the predicted segmentation + joint axes are visibly consistent. Apply suggested corrections to the URDF. Not yet implemented; the strict-mode merge + collision sweep already catch most of what a VLM would catch.
+
+---
+
+### 3.6  Phase F — Real-scan benchmark (deferred)
+
+Plan: MILO scans of 3-5 different robots beyond test_2 (UR5e, Kinova Gen3, a custom DIY arm without URDF). Per-vertex segmentation IoU, per-joint axis/origin error vs official URDF where available. Comparison to Articulate-Anything baseline on the same inputs.
+
+---
+
+### 3.7  Legacy heuristic paths (retained for historical context)
+
+Two earlier paths converge at Phase 4. **Path B (single-mesh + per-joint photos)** is the heuristic real-scan path implemented through 2026-04-24; **Path A (K pose meshes)** is the original roadmap and is validated end-to-end only on synthetic pose meshes. Both are now superseded by the learned-model path in Sections 3.1–3.4.
 
 ```
 =================================================================
@@ -289,7 +398,9 @@ Both paths produce the same Phase 3 interface (per-joint axis, origin, angle, mo
 
 ---
 
-## 4. Phased prototype plan (8-week build)
+## 4. Phased prototype plan (8-week build) — *original schedule, kept for historical context*
+
+> The actual project trajectory diverged from this plan in two places. (1) After Phase 2 was validated in week 3 we pivoted to the **learned-model path** (Sections 3.1–3.4), which replaced Phases 0/4 with a much larger 371-canonical-robot dataset and replaced the per-pose RANSAC of Phase 2 with PT-V3 training. (2) Phases 3b/4b (geometric-prior snap + tiered limit resolver) were superseded by the trained `LimitsHead` + PyBullet collision sweep in D.6. The week-by-week deliverables below describe the original heuristic build and remain useful for understanding Path A / Path B in Section 3.7.
 
 ### Phase 0 — Foundation (Week 1)
 
