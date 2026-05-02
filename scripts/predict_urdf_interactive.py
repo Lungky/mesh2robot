@@ -628,6 +628,17 @@ def build_urdf_from_predictions(
     )
     urdf_path = assemble(inp, output_dir)
 
+    # Persist body_id → original-cluster-id mapping so downstream tools
+    # (e.g. VLM critic auto-fix) can translate URDF-side link indices
+    # back to the face-label cluster IDs they were derived from.
+    if urdf_path is not None:
+        import json as _json
+        mapping_path = output_dir / "body_to_cluster.json"
+        mapping_path.write_text(_json.dumps({
+            "link_ids_in_order": [int(x) for x in link_ids_in_order],
+            "link_name_map": {str(k): v for k, v in link_name_map.items()},
+        }, indent=2))
+
     # Tier-3 sweep refinement, opt-in. Loads the just-written URDF in
     # PyBullet, sweeps each joint, returns refined (lo, hi). Then we
     # re-assemble with the refined limits replacing the model prior.
@@ -1643,6 +1654,22 @@ def main() -> None:
                              "<output>/vlm_prior.json already exists. By "
                              "default the cached prior is reused to save "
                              "API calls and time.")
+    # ── VLM critic ─────────────────────────────────────────────────────
+    parser.add_argument("--vlm-critic", action="store_true",
+                        help="Phase E.4b — after the URDF + sweep finishes, "
+                             "render the assembled URDF from the same 4 "
+                             "canonical angles, send to a VLM along with the "
+                             "input mesh views, and ask: 'what's wrong with "
+                             "this segmentation?'. Writes a structured "
+                             "CritiqueResult to <output>/vlm_critic.json. By "
+                             "default just reports issues; pass --vlm-auto-fix "
+                             "to apply safe auto-merges.")
+    parser.add_argument("--vlm-auto-fix", action="store_true",
+                        help="When the critic flags 'duplicate_link' issues "
+                             "with high severity AND a merge_into target, "
+                             "relabel face_labels to merge those links and "
+                             "re-assemble the URDF in place. Off by default; "
+                             "the critic always reports first.")
     parser.add_argument("--camera-intrinsics", type=Path, default=None,
                         help="Path to calibration.json (fx/fy/cx/cy/dist). "
                              "If omitted but --motion-dir is set, defaults "
@@ -1937,43 +1964,53 @@ def main() -> None:
 
     if not has_user_input and not has_motion:
         print("\nNo user input or motion data — refined URDF == original URDF.")
-        return
+        # Wire `refined_urdf` to the original so downstream GLB export +
+        # VLM critic (Phase E.4b) still run. final_labels mirrors the
+        # raw ML labels for the auto-fix path.
+        refined_urdf = orig_urdf
+        refined_face_labels = face_labels.copy()
+        final_labels = face_labels.copy()
+        # Skip the explicit refined-URDF-build block below by jumping
+        # past it via this guard.
+        skip_refined_build = True
+    else:
+        # Use refined labels if user provided them, else the raw ML labels.
+        final_labels = refined_face_labels if has_user_input else face_labels.copy()
+        skip_refined_build = False
 
-    # Use refined labels if user provided them, else the raw ML labels.
-    final_labels = refined_face_labels if has_user_input else face_labels.copy()
-
-    suffix_parts = []
-    if has_user_input:
-        suffix_parts.append("user")
-    if has_motion:
-        suffix_parts.append(f"motion({len(motion_overrides)}j)")
-    if args.geometric_joints:
-        suffix_parts.append("geom-joints")
-    print(f"\n--- Building refined URDF [{' + '.join(suffix_parts)}] ---")
-    refined_dir = args.output / "refined"
-    refined_dir.mkdir(parents=True, exist_ok=True)
-    refined_urdf = build_urdf_from_predictions(
-        mesh, final_labels, pred_axes, pred_origins_world,
-        pred_valid, pred_types, refined_dir,
-        robot_name="ai_predicted_refined",
-        motion_overrides=motion_overrides,
-        use_geometric_joints=args.geometric_joints,
-        pred_limits=pred_limits,
-        collision_sweep=args.collision_sweep,
-        sweep_steps=args.sweep_steps,
-        topology_mode=args.topology,
-        expected_link_count=(vlm_prior_obj.expected_link_count
-                              if vlm_prior_obj is not None else None),
-    )
-    if refined_urdf is not None:
-        print(f"  Wrote {refined_urdf}")
-        try:
-            from yourdfpy import URDF
-            r = URDF.load(str(refined_urdf))
-            print(f"  URDF loads OK: {len(r.link_map)} links, "
-                  f"{len(r.actuated_joint_names)} actuated joints")
-        except Exception as e:
-            print(f"  (yourdfpy reload failed: {e})")
+    if not skip_refined_build:
+        suffix_parts = []
+        if has_user_input:
+            suffix_parts.append("user")
+        if has_motion:
+            suffix_parts.append(f"motion({len(motion_overrides)}j)")
+        if args.geometric_joints:
+            suffix_parts.append("geom-joints")
+        print(f"\n--- Building refined URDF [{' + '.join(suffix_parts)}] ---")
+        refined_dir = args.output / "refined"
+        refined_dir.mkdir(parents=True, exist_ok=True)
+        refined_urdf = build_urdf_from_predictions(
+            mesh, final_labels, pred_axes, pred_origins_world,
+            pred_valid, pred_types, refined_dir,
+            robot_name="ai_predicted_refined",
+            motion_overrides=motion_overrides,
+            use_geometric_joints=args.geometric_joints,
+            pred_limits=pred_limits,
+            collision_sweep=args.collision_sweep,
+            sweep_steps=args.sweep_steps,
+            topology_mode=args.topology,
+            expected_link_count=(vlm_prior_obj.expected_link_count
+                                  if vlm_prior_obj is not None else None),
+        )
+        if refined_urdf is not None:
+            print(f"  Wrote {refined_urdf}")
+            try:
+                from yourdfpy import URDF
+                r = URDF.load(str(refined_urdf))
+                print(f"  URDF loads OK: {len(r.link_map)} links, "
+                      f"{len(r.actuated_joint_names)} actuated joints")
+            except Exception as e:
+                print(f"  (yourdfpy reload failed: {e})")
 
     # --- Side-by-side GLB exports for rough-vs-refined comparison ---
     # 1. user_annotation.glb : the user's directly-clicked faces colored,
@@ -2022,6 +2059,123 @@ def main() -> None:
             print(f"  Refined assembled URDF: {assembled_glb}")
         except Exception as e:
             print(f"  (refined_assembled.glb export failed: {e})")
+
+    # ── Phase E.4b — VLM critic ───────────────────────────────────────
+    # Compares the assembled URDF against the input mesh and reports
+    # abnormalities. Optional auto-fix applies safe link-merges.
+    if args.vlm_critic and refined_urdf is not None:
+        print("\n--- VLM critic ---")
+        try:
+            import json
+            from mesh2robot.core.vlm_critic import (
+                render_urdf_canonical_views,
+                critique_urdf,
+                _critique_to_dict,
+            )
+            from mesh2robot.core.vlm_prior import render_canonical_views
+            urdf_views = render_urdf_canonical_views(refined_urdf)
+            input_views = render_canonical_views(mesh)
+            # Persist URDF canonical views for audit
+            critic_views_dir = args.output / "vlm_critic_views"
+            critic_views_dir.mkdir(parents=True, exist_ok=True)
+            for name, img in zip(
+                ["front", "right", "back", "three_quarter"], urdf_views,
+            ):
+                (critic_views_dir / f"urdf_view_{name}.png").write_bytes(img)
+            # Topology summary for the prompt
+            from yourdfpy import URDF as _URDF
+            _u = _URDF.load(str(refined_urdf))
+            topo_summary = (f"{len(_u.link_map)} links, "
+                             f"{len(_u.actuated_joint_names)} actuated joints, "
+                             f"topology mode '{args.topology}'")
+            critic = critique_urdf(
+                input_views=input_views,
+                urdf_views=urdf_views,
+                prior=vlm_prior_obj,
+                n_links=len(_u.link_map),
+                n_actuated=len(_u.actuated_joint_names),
+                topology_summary=topo_summary,
+            )
+            critic_path = args.output / "vlm_critic.json"
+            with open(critic_path, "w") as f:
+                json.dump(_critique_to_dict(critic), f, indent=2)
+            print(critic)
+            print(f"  saved critique to {critic_path}")
+
+            # Auto-fix: apply safe link merges if enabled
+            merge_actions = critic.merge_actions()
+            if args.vlm_auto_fix and merge_actions:
+                print(f"\n--- Auto-fix: applying {len(merge_actions)} link "
+                      f"merge(s) ---")
+                # Translate URDF body_id → original cluster id via the
+                # mapping persisted by build_urdf_from_predictions.
+                mapping_path = refined_urdf.parent / "body_to_cluster.json"
+                body_to_cluster: list[int] | None = None
+                if mapping_path.exists():
+                    try:
+                        body_to_cluster = json.loads(
+                            mapping_path.read_text()
+                        )["link_ids_in_order"]
+                    except Exception:
+                        body_to_cluster = None
+                if body_to_cluster is None:
+                    print(f"  [WARN] body_to_cluster.json missing; "
+                          f"interpreting critic IDs as raw cluster IDs.")
+
+                final_labels_fix = (
+                    refined_face_labels.copy()
+                    if refined_face_labels is not None else face_labels.copy()
+                )
+                for action in merge_actions:
+                    dst_body = int(action.target)
+                    dst_cluster = (body_to_cluster[dst_body]
+                                    if body_to_cluster is not None and
+                                       0 <= dst_body < len(body_to_cluster)
+                                    else dst_body)
+                    for src_body in action.sources:
+                        src_cluster = (body_to_cluster[int(src_body)]
+                                        if body_to_cluster is not None and
+                                           0 <= int(src_body) < len(body_to_cluster)
+                                        else int(src_body))
+                        n_changed = int(
+                            (final_labels_fix == src_cluster).sum()
+                        )
+                        final_labels_fix[
+                            final_labels_fix == src_cluster
+                        ] = dst_cluster
+                        print(f"  merged URDF link_{src_body} (cluster_{src_cluster}) "
+                              f"→ link_{dst_body} (cluster_{dst_cluster})  "
+                              f"[{n_changed} faces] — {action.rationale}")
+
+                fixed_dir = args.output / "refined_fixed"
+                fixed_dir.mkdir(parents=True, exist_ok=True)
+                fixed_urdf = build_urdf_from_predictions(
+                    mesh, final_labels_fix, pred_axes, pred_origins_world,
+                    pred_valid, pred_types, fixed_dir,
+                    robot_name="ai_predicted_refined_fixed",
+                    motion_overrides=motion_overrides,
+                    use_geometric_joints=args.geometric_joints,
+                    pred_limits=pred_limits,
+                    collision_sweep=args.collision_sweep,
+                    sweep_steps=args.sweep_steps,
+                    topology_mode=args.topology,
+                    expected_link_count=(vlm_prior_obj.expected_link_count
+                                          if vlm_prior_obj is not None else None),
+                )
+                if fixed_urdf is not None:
+                    print(f"  Wrote auto-fixed URDF: {fixed_urdf}")
+                    try:
+                        fixed_scene = render_from_urdf(fixed_urdf)
+                        fixed_glb = args.output / "refined_fixed_assembled.glb"
+                        fixed_scene.export(str(fixed_glb))
+                        print(f"  Fixed-URDF GLB: {fixed_glb}")
+                    except Exception as e:
+                        print(f"  (fixed GLB export failed: {e})")
+            elif merge_actions:
+                print(f"\n  {len(merge_actions)} merge action(s) suggested; "
+                      f"re-run with --vlm-auto-fix to apply.")
+        except Exception as e:
+            print(f"  [WARN] VLM critic failed: {type(e).__name__}: {e}")
 
     print(f"\nHistory entries: {len(history)}")
     for i, h in enumerate(history):
