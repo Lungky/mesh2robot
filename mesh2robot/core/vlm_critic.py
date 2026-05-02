@@ -240,50 +240,51 @@ INPUTS:
     colour-coded.
 
 CONTEXT:
-  - The robot was independently classified by a different VLM call as:
+  - The robot was independently classified by another VLM as:
     {prior_summary}
+    Trust this prior. The expected DOF and link count are GROUND TRUTH
+    targets that the URDF should approximately match.
   - The URDF has {n_links} links and {n_actuated} actuated joints.
   - Topology used: {topology_summary}
-  - Link ID numbering: when you reference a link by index, use the integer
-    that matches its position in the URDF (link_0 = root/torso, link_1 =
-    first child, etc.). You'll have to identify links by their colours
-    in the rendered views.
+  - Link ID numbering: integers matching position in the URDF (0 = root,
+    1, 2, ... in BFS order). Identify links by their colours in the
+    rendered views.
+
+CALIBRATION GUIDANCE — these are heuristics, not strict rules:
+
+  (a) The prior's expected_dof and expected_link_count are estimates,
+      not ground truth. Sometimes the actual robot has fewer or more
+      DOFs than visually apparent (passive joints, hidden actuation).
+      Use the prior as ORIENTATION, not as a hard target.
+
+  (b) "Phantom link" check: a phantom link is a small,
+      geometrically-incoherent fragment scattered around the surface
+      that isn't a real body part. NOT every "thin segment near a
+      joint" is a phantom — many real robots have thin connector
+      segments that are genuine kinematic links (shoulder yaw bracket,
+      wrist hub, etc.). If a thin link sits exactly where you'd expect
+      a joint to be in the kinematic chain, it's likely real.
+
+  (c) Don't fabricate problems. If the URDF's link count is close to
+      what a robot of this class typically has, prefer empty
+      auto_fix_merges and only `low` severity issues.
 
 YOUR TASK has TWO parts:
 
 PART 1 — Diagnostic issues (the `issues` array).
-  List EVERY abnormality you can identify. For each:
-    - type: pick the closest match from schema enum.
-    - severity: 'low' / 'medium' / 'high' / 'critical'.
-    - description: 1-2 sentences.
-    - affected_links: list of integer link IDs.
-    - suggested_action: a concrete instruction.
-  Issues are for HUMAN REPORTING. They don't get auto-applied.
+  List concrete abnormalities. For each:
+    - type, severity, description, affected_links, suggested_action.
+  Issues are for HUMAN REPORTING. They are NOT auto-applied.
 
 PART 2 — Auto-fix merges (the `auto_fix_merges` array).
-  This is SEPARATE from issues. Populate it ONLY with link merges you are
-  CONFIDENT are correct. The pipeline will relabel face_labels +
-  re-assemble the URDF. Each merge:
-    - target: the link ID that will REMAIN.
-    - sources: list of link IDs to be DISSOLVED into target.
-    - rationale: 1 sentence why.
-
-  When to add a merge to auto_fix_merges:
-    - You are SURE the source links are spurious sub-segments of the
-      target. Bilateral-symmetry hands, over-segmented torsos, phantom
-      tip links — these qualify.
-  When NOT to add a merge:
-    - The fix is "add a missing link" — there's no merge to do; report
-      it in issues only.
-    - You're uncertain which side is the right target.
-    - The fix involves re-parenting (changing topology), not merging.
-
-  If there are no safe merges, return auto_fix_merges as an empty array.
+  Populate ONLY with merges you are CONFIDENT will improve the URDF
+  WITHOUT violating Rule 2 above. Each merge: target, sources,
+  rationale. When unsure: empty array.
 
 PART 3 — Overall verdict.
-  - matches_well: true ONLY if every issue is severity 'low'.
-  - overall_score: 0..1 confidence the URDF is good.
-  - summary: 1-2 sentences plain-English verdict.
+  - matches_well: true ONLY if every issue is 'low' severity.
+  - overall_score: 0..1 honest confidence.
+  - summary: 1-2 sentence plain-English verdict.
 """
 
 
