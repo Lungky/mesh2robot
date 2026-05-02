@@ -258,6 +258,13 @@ def main() -> None:
                         help="Examples packed per shard file")
     parser.add_argument("--limit-robots", type=int, default=0,
                         help="If > 0, only process this many robots (smoke run)")
+    parser.add_argument("--skip-robots", type=int, default=0,
+                        help="Skip the first N robots in the trainable list. "
+                             "Useful for resuming after a crash (set N to the "
+                             "number of robots already done in a sibling output "
+                             "dir; the deterministic --seed produces identical "
+                             "shards for a given index, so combined output is "
+                             "consistent).")
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--format", choices=["urdf", "mjcf", "all"],
@@ -275,6 +282,10 @@ def main() -> None:
 
     fmt_filter = None if args.format == "all" else [args.format]
     trainable = [e for e in manifest if _is_trainable(e, fmt_filter)]
+    if args.skip_robots > 0:
+        skipped = trainable[: args.skip_robots]
+        trainable = trainable[args.skip_robots:]
+        print(f"Skipping first {len(skipped)} robots (--skip-robots)")
     if args.limit_robots > 0:
         trainable = trainable[: args.limit_robots]
     print(f"Trainable robots after filter: {len(trainable)}")
@@ -302,17 +313,20 @@ def main() -> None:
     if args.workers <= 1:
         # Single-process path (legacy, simple)
         for robot_i, entry in enumerate(trainable):
+            # Preserve the ORIGINAL trainable index for seed/idx purposes when
+            # --skip-robots was used; this keeps determinism with the full run.
+            orig_robot_i = robot_i + args.skip_robots
             full_path = args.raw_dir / entry["path"]
             is_mjcf = entry.get("format") == "mjcf"
             try:
                 robot = load_robot_mjcf(full_path) if is_mjcf else load_robot(full_path)
             except Exception as e:
-                print(f"  [{robot_i+1}/{len(trainable)}] LOAD FAILED  "
+                print(f"  [{orig_robot_i+1}/{len(trainable)+args.skip_robots}] LOAD FAILED  "
                       f"{entry['source']}/{Path(entry['path']).name}: "
                       f"{type(e).__name__}: {str(e)[:80]}")
                 n_failed += 1
                 continue
-            rng = np.random.default_rng(args.seed + robot_i * 100003)
+            rng = np.random.default_rng(args.seed + orig_robot_i * 100003)
             mesh_cache: dict = {}
             n_ok_this_robot = 0
             for k in range(args.n_configs):
@@ -349,6 +363,8 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=args.workers) as exe:
             futures = {}
             for robot_i, entry in enumerate(trainable):
+                # Preserve original index for seed determinism with --skip-robots.
+                orig_robot_i = robot_i + args.skip_robots
                 fut = exe.submit(
                     _process_one_robot,
                     str(args.raw_dir),
@@ -357,9 +373,9 @@ def main() -> None:
                     args.n_points,
                     not args.no_augment,
                     args.seed,
-                    robot_i,
+                    orig_robot_i,
                 )
-                futures[fut] = (robot_i, entry)
+                futures[fut] = (orig_robot_i, entry)
             done_i = 0
             for fut in as_completed(futures):
                 robot_i, entry = futures[fut]
