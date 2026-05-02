@@ -374,6 +374,7 @@ def build_urdf_from_predictions(
     sweep_steps: int = 64,
     topology_mode: str = "serial",
     expected_link_count: int | None = None,
+    cleanup_clusters: bool = True,
 ) -> Path | None:
     """Build a URDF from face labels + joint predictions. Mirrors
     `predict_urdf.py`'s steps 4–8.
@@ -402,6 +403,23 @@ def build_urdf_from_predictions(
     Precedence: geometric > motion > ML for axes/origins/types.
     Limits source order: model > ±π fallback. Sweep refines whatever
     limits ended up emitted."""
+    # ── Connected-component cleanup ───────────────────────────────────
+    # Each label can span disconnected fragments scattered across the
+    # mesh ("one link is a bunch of random shards" failure mode).
+    # Split each label into its connected components: largest keeps the
+    # label, sizable detached components get a fresh label, tiny stray
+    # fragments are absorbed into their dominant neighbour.
+    if cleanup_clusters:
+        from mesh2robot.core.topology import (
+            clean_disconnected_clusters, cleanup_summary,
+        )
+        cleaned = clean_disconnected_clusters(
+            mesh, face_labels, min_component_faces=30,
+        )
+        if not np.array_equal(cleaned, face_labels):
+            print(cleanup_summary(face_labels, cleaned))
+            face_labels = cleaned
+
     # ── VLM-prior cluster pruning ─────────────────────────────────────
     # If the VLM said "this robot has N links", drop the smallest
     # clusters until we're at most expected_link_count + 2. The +2
@@ -1670,6 +1688,12 @@ def main() -> None:
                              "relabel face_labels to merge those links and "
                              "re-assemble the URDF in place. Off by default; "
                              "the critic always reports first.")
+    parser.add_argument("--no-cleanup-clusters", action="store_true",
+                        help="Disable the connected-component cleanup that "
+                             "splits each label into its connected pieces "
+                             "(largest keeps the label; small strays get "
+                             "absorbed into their dominant neighbour). "
+                             "Default: on. Disable to inspect raw ML segmentation.")
     parser.add_argument("--camera-intrinsics", type=Path, default=None,
                         help="Path to calibration.json (fx/fy/cx/cy/dist). "
                              "If omitted but --motion-dir is set, defaults "
@@ -1902,6 +1926,7 @@ def main() -> None:
         topology_mode=args.topology,
         expected_link_count=(vlm_prior_obj.expected_link_count
                               if vlm_prior_obj is not None else None),
+        cleanup_clusters=not args.no_cleanup_clusters,
     )
     if orig_urdf is not None:
         print(f"  Wrote {orig_urdf}")
@@ -2001,6 +2026,7 @@ def main() -> None:
             topology_mode=args.topology,
             expected_link_count=(vlm_prior_obj.expected_link_count
                                   if vlm_prior_obj is not None else None),
+            cleanup_clusters=not args.no_cleanup_clusters,
         )
         if refined_urdf is not None:
             print(f"  Wrote {refined_urdf}")
@@ -2161,6 +2187,7 @@ def main() -> None:
                     topology_mode=args.topology,
                     expected_link_count=(vlm_prior_obj.expected_link_count
                                           if vlm_prior_obj is not None else None),
+                    cleanup_clusters=not args.no_cleanup_clusters,
                 )
                 if fixed_urdf is not None:
                     print(f"  Wrote auto-fixed URDF: {fixed_urdf}")

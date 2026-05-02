@@ -1,4 +1,4 @@
-"""Phase E.2 — Tree-topology inference from per-face link labels.
+"""Phase E.2 + segmentation hygiene — Tree-topology inference + cluster cleanup.
 
 The original `predict_urdf_interactive.build_urdf_from_predictions`
 hardcoded a serial chain (Z-sort the links, emit joint i → i+1).
@@ -24,7 +24,7 @@ The tree is exposed as a `TreeTopology` dataclass; consumers like
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -213,6 +213,129 @@ def infer_tree_topology(
 # ---------------------------------------------------------------------------
 # Convenience
 # ---------------------------------------------------------------------------
+
+def clean_disconnected_clusters(
+    mesh: trimesh.Trimesh,
+    face_labels: np.ndarray,
+    fresh_label_floor: float = 0.0,
+    min_component_faces: int = 50,
+) -> np.ndarray:
+    """Spatial-coherence cleanup of per-face labels.
+
+    A model-predicted label can span DISCONNECTED fragments scattered
+    across the mesh — this is the "one link is a bunch of random
+    shards" failure mode. The fix:
+
+      1. For each unique label, find its connected components on the
+         mesh face-adjacency graph.
+      2. Keep the LARGEST component on the original label.
+      3. For each other component:
+         - DEFAULT (`fresh_label_floor=0.0`): always absorb into the
+           most common adjacent label. This eliminates scattered
+           shards and consolidates each label into a single coherent
+           region — the typical desired behaviour.
+         - With `fresh_label_floor > 0`: promote a stray component
+           to a FRESH label only if it's BOTH >= `min_component_faces`
+           AND >= `fresh_label_floor` × the largest-component size.
+           Use this when you suspect the model genuinely mis-merged
+           two distinct body parts under one label and you want to
+           recover them. Costs label-count growth.
+
+    Returns a NEW face_labels array; original is not mutated.
+    """
+    new_labels = face_labels.copy()
+    adj = np.asarray(mesh.face_adjacency)   # (E, 2)
+    if adj.size == 0:
+        return new_labels
+
+    next_fresh_label = int(new_labels.max()) + 1
+    unique_labels = sorted(int(l) for l in np.unique(new_labels) if l >= 0)
+
+    for lbl in unique_labels:
+        face_mask = new_labels == lbl
+        if not face_mask.any():
+            continue
+
+        face_indices = np.where(face_mask)[0]
+        parent = {int(f): int(f) for f in face_indices}
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        edge_mask = face_mask[adj[:, 0]] & face_mask[adj[:, 1]]
+        for a, b in adj[edge_mask]:
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                parent[ra] = rb
+
+        components: dict[int, list[int]] = {}
+        for f in face_indices:
+            r = find(int(f))
+            components.setdefault(r, []).append(int(f))
+
+        if len(components) <= 1:
+            continue   # all connected — nothing to do
+
+        comps_sorted = sorted(components.values(), key=len, reverse=True)
+        largest_size = len(comps_sorted[0])
+        # promote_disabled when fresh_label_floor==0 (default)
+        promote_disabled = (fresh_label_floor <= 0.0)
+        promote_threshold = (
+            None if promote_disabled
+            else max(min_component_faces,
+                     int(largest_size * fresh_label_floor))
+        )
+
+        # Pre-compute dominant-neighbour for each stray component.
+        # Note: we read from `new_labels` AT THE TIME OF ABSORBING — so
+        # earlier absorbs in this loop already affect later ones, which
+        # is correct: a fragment absorbed into neighbour X should then
+        # let other fragments see X as their potential target too.
+        for stray in comps_sorted[1:]:
+            if (not promote_disabled
+                    and promote_threshold is not None
+                    and len(stray) >= promote_threshold):
+                for f in stray:
+                    new_labels[f] = next_fresh_label
+                next_fresh_label += 1
+            else:
+                stray_set = set(stray)
+                neighbour_counts: Counter[int] = Counter()
+                for a, b in adj:
+                    a_in = int(a) in stray_set
+                    b_in = int(b) in stray_set
+                    if a_in and not b_in:
+                        neighbour_counts[int(new_labels[b])] += 1
+                    elif b_in and not a_in:
+                        neighbour_counts[int(new_labels[a])] += 1
+                if neighbour_counts:
+                    # Don't absorb into the same label (would no-op anyway,
+                    # but skip in case future logic changes).
+                    candidates = [t for t in neighbour_counts.most_common()
+                                   if t[0] != lbl]
+                    if candidates:
+                        target = candidates[0][0]
+                        for f in stray:
+                            new_labels[f] = target
+
+    return new_labels
+
+
+def cleanup_summary(
+    before: np.ndarray,
+    after: np.ndarray,
+) -> str:
+    """Compact diff for logging."""
+    b_unique = sorted(int(l) for l in np.unique(before) if l >= 0)
+    a_unique = sorted(int(l) for l in np.unique(after) if l >= 0)
+    n_changed = int((before != after).sum())
+    return (f"  cleanup: labels {len(b_unique)}→{len(a_unique)}; "
+            f"{n_changed}/{len(before)} faces relabeled "
+            f"({100 * n_changed / max(len(before), 1):.1f}%)")
+
 
 def infer_topology_auto(
     mesh: trimesh.Trimesh,
