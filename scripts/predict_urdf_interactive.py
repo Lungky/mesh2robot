@@ -52,11 +52,18 @@ from __future__ import annotations
 
 import argparse
 import sys
+import pathlib
 from pathlib import Path
 
 import numpy as np
 import torch
 import trimesh
+
+# Cross-platform checkpoint loading: checkpoints saved on Linux contain
+# PosixPath objects in args; pickle can't instantiate PosixPath on Windows.
+# Aliasing it to WindowsPath at unpickle time resolves it transparently.
+if sys.platform == "win32":
+    pathlib.PosixPath = pathlib.WindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
