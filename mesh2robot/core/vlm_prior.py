@@ -302,6 +302,26 @@ def _dict_to_prior(d: dict) -> RobotPrior:
     )
 
 
+def _prior_to_dict(p: RobotPrior) -> dict:
+    """Inverse of `_dict_to_prior` — for caching/persisting a prior."""
+    return {
+        "robot_class": p.robot_class,
+        "expected_dof": p.expected_dof,
+        "expected_link_count": p.expected_link_count,
+        "expected_chain_topology": p.expected_chain_topology,
+        "visible_joints": [
+            {
+                "description": j.description,
+                "axis_hint": j.axis_hint,
+                "location": j.location,
+            }
+            for j in p.visible_joints
+        ],
+        "confidence": p.confidence,
+        "visual_summary": p.visual_summary,
+    }
+
+
 # ---------------------------------------------------------------------------
 # High-level convenience
 # ---------------------------------------------------------------------------

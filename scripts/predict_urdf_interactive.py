@@ -373,6 +373,7 @@ def build_urdf_from_predictions(
     collision_sweep: bool = False,
     sweep_steps: int = 64,
     topology_mode: str = "serial",
+    expected_link_count: int | None = None,
 ) -> Path | None:
     """Build a URDF from face labels + joint predictions. Mirrors
     `predict_urdf.py`'s steps 4–8.
@@ -401,7 +402,33 @@ def build_urdf_from_predictions(
     Precedence: geometric > motion > ML for axes/origins/types.
     Limits source order: model > ±π fallback. Sweep refines whatever
     limits ended up emitted."""
-    per_link_meshes = split_mesh_by_face_labels(mesh, face_labels, min_faces=30)
+    # ── VLM-prior cluster pruning ─────────────────────────────────────
+    # If the VLM said "this robot has N links", drop the smallest
+    # clusters until we're at most expected_link_count + 2. The +2
+    # buffer lets the strict-mode merge absorb any noise. We do this
+    # by bumping `min_faces` adaptively, which is what
+    # split_mesh_by_face_labels uses to filter.
+    pruning_floor = 30
+    if expected_link_count is not None and expected_link_count > 0:
+        from collections import Counter
+        # Only count clusters that already pass the basic floor — anything
+        # smaller is out anyway.
+        counts = sorted(
+            (n for lid, n in Counter(face_labels.tolist()).items()
+             if int(lid) >= 0 and n >= pruning_floor),
+            reverse=True,
+        )
+        target = expected_link_count + 2
+        if len(counts) > target:
+            # Keep top `target` clusters: bump min_faces above the
+            # (target+1)-th largest cluster's size.
+            pruning_floor = max(pruning_floor, counts[target] + 1)
+            print(f"  VLM-prune: {len(counts)} ML clusters → keeping top "
+                  f"{target} (expected_link_count={expected_link_count} + 2 "
+                  f"buffer); min_faces bumped to {pruning_floor}.")
+
+    per_link_meshes = split_mesh_by_face_labels(mesh, face_labels,
+                                                 min_faces=pruning_floor)
     if len(per_link_meshes) < 2:
         print(f"  Need >= 2 links to assemble; got {len(per_link_meshes)}. Skipping.")
         return None
@@ -1585,14 +1612,37 @@ def main() -> None:
                         help="Samples per side per joint for --collision-sweep. "
                              "Higher = tighter bound, slower (default 64).")
     parser.add_argument("--topology",
-                        choices=["serial", "tree", "auto"],
+                        choices=["serial", "tree", "auto", "vlm"],
                         default="serial",
                         help="Kinematic chain layout. 'serial' (default) "
                              "Z-sorts links into a single chain — correct for "
                              "industrial arms. 'tree' infers parent-child via "
                              "face-adjacency BFS — correct for humanoids, "
                              "quadrupeds, multi-arm rigs. 'auto' tries tree "
-                             "and falls back to serial when the graph is a path.")
+                             "and falls back to serial when the graph is a "
+                             "path. 'vlm' takes the VLM prior's topology answer "
+                             "(requires --vlm-prior); falls back to 'auto' if "
+                             "the VLM is unavailable or low-confidence.")
+    # ── VLM prior ──────────────────────────────────────────────────────
+    parser.add_argument("--vlm-prior", action="store_true",
+                        help="Phase E.4a — before any other stage, render 4 "
+                             "canonical-angle views of the mesh and ask a VLM "
+                             "(see --vlm-backend) what kind of robot it is. "
+                             "The structured prior is saved to <output>/vlm_prior.json "
+                             "and used to: (a) hard-block when expected_dof=0 "
+                             "(non-articulated mesh), (b) auto-pick --topology "
+                             "when set to 'vlm', (c) prune the ML's "
+                             "over-segmented clusters down to ~expected_link_count "
+                             "before URDF assembly.")
+    parser.add_argument("--vlm-backend", choices=["gemini"], default="gemini",
+                        help="VLM backend for --vlm-prior. Currently only "
+                             "Gemini (free tier). Anthropic / OpenAI will be "
+                             "added later via the same Protocol.")
+    parser.add_argument("--refresh-vlm", action="store_true",
+                        help="Force a fresh VLM call even if "
+                             "<output>/vlm_prior.json already exists. By "
+                             "default the cached prior is reused to save "
+                             "API calls and time.")
     parser.add_argument("--camera-intrinsics", type=Path, default=None,
                         help="Path to calibration.json (fx/fy/cx/cy/dist). "
                              "If omitted but --motion-dir is set, defaults "
@@ -1617,6 +1667,74 @@ def main() -> None:
           f"AABB extent={np.round(mesh.extents, 3).tolist()}")
 
     face_centers = np.asarray(mesh.vertices)[mesh.faces].mean(axis=1)
+
+    # ── Phase E.4a — VLM prior ────────────────────────────────────────
+    # Runs BEFORE annotation/ML so we can hard-block on rigid meshes,
+    # auto-pick topology, and prune over-segmentation later.
+    vlm_prior_obj = None
+    if args.vlm_prior:
+        import json
+        from dataclasses import asdict
+        from mesh2robot.core.vlm_prior import (
+            get_robot_prior, _dict_to_prior, _prior_to_dict,
+        )
+        prior_path = args.output / "vlm_prior.json"
+        if prior_path.exists() and not args.refresh_vlm:
+            print(f"\n--- VLM prior (cached) ---")
+            cached = json.loads(prior_path.read_text())
+            vlm_prior_obj = _dict_to_prior(cached)
+            print(f"  loaded from {prior_path} (use --refresh-vlm to re-call)")
+        else:
+            print(f"\n--- VLM prior ({args.vlm_backend}) ---")
+            try:
+                vlm_prior_obj = get_robot_prior(
+                    mesh,
+                    backend=args.vlm_backend,
+                    save_dir=args.output / "vlm_views",
+                )
+                # Persist for caching + audit
+                with open(prior_path, "w") as f:
+                    json.dump(_prior_to_dict(vlm_prior_obj), f, indent=2)
+                print(f"  saved prior to {prior_path}")
+            except Exception as e:
+                print(f"  [WARN] VLM prior failed: {type(e).__name__}: {e}")
+                print(f"         continuing without prior (no auto-topology, "
+                      f"no cluster pruning, no rigid-mesh block).")
+                vlm_prior_obj = None
+
+        if vlm_prior_obj is not None:
+            print(vlm_prior_obj)
+
+            # Hard-block on non-articulated meshes (only when no user
+            # annotations — if the user is hand-labeling, they overrule
+            # the VLM).
+            if (vlm_prior_obj.expected_dof == 0
+                    and args.user_annotations is None
+                    and args.no_gui):
+                print(f"\n[ABORT] VLM says expected_dof=0 — this mesh has no "
+                      f"visible articulation (likely a rigid model or static "
+                      f"object). No URDF will be generated.\n"
+                      f"        If you want to override, run with annotations "
+                      f"or skip --vlm-prior.")
+                return
+
+            # Auto-pick topology when --topology vlm
+            if args.topology == "vlm":
+                if (vlm_prior_obj.is_high_confidence()
+                        and vlm_prior_obj.expected_chain_topology != "unknown"):
+                    mapped = {
+                        "serial": "serial",
+                        "tree": "tree",
+                        "parallel": "auto",  # try tree, may degrade
+                    }.get(vlm_prior_obj.expected_chain_topology, "auto")
+                    print(f"  --topology vlm → using {mapped!r} "
+                          f"(VLM topology={vlm_prior_obj.expected_chain_topology}, "
+                          f"confidence={vlm_prior_obj.confidence:.2f})")
+                    args.topology = mapped
+                else:
+                    print(f"  --topology vlm → falling back to 'auto' "
+                          f"(VLM low-confidence or topology=unknown)")
+                    args.topology = "auto"
 
     # --- PRE-SELECT MODE (default): user annotates BEFORE the model runs.
     # The viewer shows the mesh shaded by surface normals; the user marks
@@ -1755,6 +1873,8 @@ def main() -> None:
         collision_sweep=args.collision_sweep,
         sweep_steps=args.sweep_steps,
         topology_mode=args.topology,
+        expected_link_count=(vlm_prior_obj.expected_link_count
+                              if vlm_prior_obj is not None else None),
     )
     if orig_urdf is not None:
         print(f"  Wrote {orig_urdf}")
@@ -1842,6 +1962,8 @@ def main() -> None:
         collision_sweep=args.collision_sweep,
         sweep_steps=args.sweep_steps,
         topology_mode=args.topology,
+        expected_link_count=(vlm_prior_obj.expected_link_count
+                              if vlm_prior_obj is not None else None),
     )
     if refined_urdf is not None:
         print(f"  Wrote {refined_urdf}")
